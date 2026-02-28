@@ -133,17 +133,27 @@ def _render_project_wizard(df: pd.DataFrame):
 
     if mode == "修改已有项目":
         st.markdown("### 步骤 1：查找要修改的项目")
+        # 1. 按园区筛选（优先）
+        园区列表 = sorted(df["园区"].dropna().astype(str).unique().tolist())
+        园区列表 = [p for p in 园区列表 if p and str(p).strip() and str(p) != "nan"]
+        园区选择 = st.multiselect(
+            "按园区筛选（选填，不选则显示全部）",
+            options=园区列表,
+            default=[],
+            key="wizard_search_园区",
+        )
+        candidates = df.copy()
+        if 园区选择:
+            candidates = candidates[candidates["园区"].astype(str).isin(园区选择)]
+            st.caption(f"已筛选园区：{', '.join(园区选择)}，共 {len(candidates)} 条")
+
+        # 2. 序号、项目名称进一步筛选
         col1, col2 = st.columns(2)
         with col1:
             seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
         with col2:
             name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
 
-        if not seq_input.strip() and not name_kw.strip():
-            st.info("请先输入序号或项目名称关键词，然后回车进行查找。")
-            return
-
-        candidates = df.copy()
         if seq_input.strip():
             try:
                 seq_val = int(float(seq_input.strip()))
@@ -153,8 +163,12 @@ def _render_project_wizard(df: pd.DataFrame):
         if name_kw.strip():
             candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
 
+        if not 园区选择 and not seq_input.strip() and not name_kw.strip():
+            st.info("请至少选择园区、或输入序号、或输入项目名称关键词进行筛选。")
+            return
+
         if candidates.empty:
-            st.info("未找到匹配项目，可切换到「新增项目」，或调整查找条件。")
+            st.info("未找到匹配项目，可切换到「新增项目」，或调整园区/序号/名称筛选条件。")
             return
 
         st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
@@ -163,7 +177,11 @@ def _render_project_wizard(df: pd.DataFrame):
         st.dataframe(candidates[display_cols].head(50), use_container_width=True, hide_index=True)
 
         seq_choices = sorted(candidates["序号"].dropna().astype(int).unique().tolist())
-        chosen_seq = st.selectbox("选择要修改的项目序号", options=seq_choices)
+        def _fmt(seq):
+            row = candidates[candidates["序号"].astype(int) == seq]
+            name = str(row["项目名称"].iloc[0])[:40] if len(row) and "项目名称" in row.columns else ""
+            return f"{seq} - {name}" if name else str(seq)
+        chosen_seq = st.selectbox("选择要修改的项目", options=seq_choices, format_func=_fmt)
         target_row = df_all[df_all["序号"].astype(int) == int(chosen_seq)].iloc[0]
 
         st.markdown("---")
