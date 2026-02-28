@@ -170,7 +170,7 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
 
         with st.form("edit_project_form"):
-            st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次修改的内容将推送到飞书。")
+            st.caption("提示：保存后若有飞书 Webhook 配置（环境变量 FEISHU_WEBHOOK_URL 或 .streamlit/secrets.toml），将自动推送到飞书。")
             st.markdown("**基础信息**")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -230,7 +230,7 @@ def _render_project_wizard(df: pd.DataFrame):
         if delete_clicked:
             df_new = df_all[df_all["序号"].astype(int) != seq_val].copy()
             save_to_db(df_new)
-            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+            if get_feishu_webhook_url():
                 diff = {"deleted": [row_to_dict(target_row)], "added": [], "modified": []}
                 payload = build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
                 push_to_feishu(payload=payload)
@@ -253,7 +253,7 @@ def _render_project_wizard(df: pd.DataFrame):
                 if col in df_new.columns:
                     df_new.loc[mask, col] = val
             save_to_db(df_new)
-            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+            if get_feishu_webhook_url():
                 modified_row = df_new.loc[mask].iloc[0]
                 changes = []
                 for col in target_row.index:
@@ -282,7 +282,7 @@ def _render_project_wizard(df: pd.DataFrame):
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
-        st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次录入的内容将推送到飞书。")
+        st.caption("提示：保存后若有飞书 Webhook 配置，将自动推送到飞书。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -350,7 +350,7 @@ def _render_project_wizard(df: pd.DataFrame):
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
         save_to_db(df_all2)
-        if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+        if get_feishu_webhook_url():
             diff = {"deleted": [], "added": [row_to_dict(df_new_row.iloc[0])], "modified": []}
             payload = build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
             push_to_feishu(payload=payload)
@@ -362,7 +362,7 @@ def _render_project_wizard(df: pd.DataFrame):
 def main():
     st.set_page_config(page_title="养老社区项目向导", page_icon="🏠", layout="wide")
     st.title("养老社区改良改造 - 项目新增/修改向导")
-    st.caption("支持项目录入、修改、删除，可选推送到飞书群。")
+    st.caption("支持项目录入、修改、删除，保存时默认推送到飞书（需配置 Webhook）。")
 
     with st.sidebar:
         st.header("数据源")
@@ -382,7 +382,7 @@ def main():
                         df = load_single_csv(str(default_csv))
                         if not df.empty:
                             save_to_db(df)
-                            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+                            if get_feishu_webhook_url():
                                 if push_to_feishu(f"【养老社区进度表】已用「改良改造报表-V4.csv」初始化，共 {len(df)} 条记录。"):
                                     st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
                                 else:
@@ -417,7 +417,7 @@ def main():
                         st.success(f"已解析：{name}，共 {len(df)} 条记录。")
                         if st.button("✅ 保存到数据库（覆盖原有数据）", type="primary"):
                             save_to_db(df)
-                            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+                            if get_feishu_webhook_url():
                                 if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（上传文件：{name}）"):
                                     st.success("已保存到 SQLite 并已推送至飞书。")
                                 else:
@@ -434,7 +434,7 @@ def main():
                         df = load_uploaded(single_path, filename=Path(single_path).name)
                         if st.button("保存到数据库", key="save_from_path"):
                             save_to_db(df)
-                            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+                            if get_feishu_webhook_url():
                                 push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。")
                             st.rerun()
                     except Exception as e:
@@ -452,22 +452,11 @@ def main():
                         st.success(f"已从目录加载，共 {len(df)} 条记录。")
                         if st.button("✅ 保存到数据库（覆盖原有数据）", type="primary"):
                             save_to_db(df)
-                            if st.session_state.get("feishu_push_on_save") and get_feishu_webhook_url():
+                            if get_feishu_webhook_url():
                                 push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（目录导入）")
                             st.rerun()
                 except Exception as e:
                     st.error(f"加载失败：{e}")
-
-        st.markdown("---")
-        with st.expander("飞书推送", expanded=False):
-            st.caption("需先在飞书群添加「自定义机器人」并复制 Webhook 地址。")
-            st.text_input(
-                "飞书机器人 Webhook URL",
-                key="feishu_webhook_url",
-                type="password",
-                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...",
-            )
-            st.checkbox("保存到数据库时同时推送到飞书", value=False, key="feishu_push_on_save")
 
     if df.empty:
         st.warning("请先在侧边栏选择或上传数据源。")
