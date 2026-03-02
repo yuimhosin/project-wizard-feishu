@@ -113,6 +113,23 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+DATE_FORMAT = "YYYY-MM-DD"
+
+def _normalize_date(s) -> str:
+    """将日期字符串规范为 YYYY-MM-DD 格式，无效则返回空。"""
+    if s is None or (isinstance(s, str) and not s.strip()):
+        return ""
+    s = str(s).strip()
+    if not s:
+        return ""
+    try:
+        dt = pd.to_datetime(s, errors="coerce", format="mixed")
+        if pd.isna(dt):
+            return s
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return s
+
 def _get_next_序号(df: pd.DataFrame) -> int:
     """根据现有数据自动生成下一个序号。"""
     if "序号" not in df.columns or df.empty:
@@ -229,12 +246,12 @@ def _render_project_wizard(df: pd.DataFrame):
             项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
             备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
 
-            st.markdown("**项目节点日期（全部选填）**")
+            st.markdown(f"**项目节点日期**（格式：{DATE_FORMAT}，选填）")
             date_values = {}
             for col in TIMELINE_COLS:
                 raw_val = target_row.get(col, "")
-                date_str = "" if pd.isna(raw_val) else str(raw_val)
-                date_values[col] = st.text_input(f"{col}（选填）", value=date_str)
+                date_str = _normalize_date(raw_val) if raw_val and not pd.isna(raw_val) else ""
+                date_values[col] = st.text_input(col, value=date_str, placeholder="如：2026-01-15")
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -268,7 +285,7 @@ def _render_project_wizard(df: pd.DataFrame):
             for col, val in date_values.items():
                 if col not in df_new.columns:
                     df_new[col] = ""
-                df_new.loc[mask, col] = val
+                df_new.loc[mask, col] = _normalize_date(val)
             save_to_db(df_new)
             if get_feishu_webhook_url():
                 modified_row = df_new.loc[mask].iloc[0]
@@ -334,10 +351,10 @@ def _render_project_wizard(df: pd.DataFrame):
         备注说明 = st.text_area("备注说明（选填）")
         拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=0.0, step=1.0)
 
-        st.markdown("**项目节点日期（全部选填）**")
+        st.markdown(f"**项目节点日期**（格式：{DATE_FORMAT}，选填）")
         date_values = {}
         for col in TIMELINE_COLS:
-            date_values[col] = st.text_input(f"{col}（选填）", value="", key=f"add_{col}")
+            date_values[col] = st.text_input(col, value="", placeholder="如：2026-01-15", key=f"add_{col}")
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
 
@@ -362,7 +379,7 @@ def _render_project_wizard(df: pd.DataFrame):
         token = str(uuid.uuid4())
         form_dict["上传凭证"] = token
         for col, val in date_values.items():
-            form_dict[col] = val
+            form_dict[col] = _normalize_date(val)
 
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
