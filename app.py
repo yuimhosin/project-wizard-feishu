@@ -57,7 +57,7 @@ def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
         "序号", "园区", "所属区域", "城市", "所属业态",
         "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
         "专业", "专业分包", "项目名称", "备注说明", "拟定金额", "上传凭证",
-    ]
+    ] + list(TIMELINE_COLS)
     out = df.copy()
     for col in needed:
         if col not in out.columns:
@@ -232,11 +232,9 @@ def _render_project_wizard(df: pd.DataFrame):
             st.markdown("**项目节点日期（全部选填）**")
             date_values = {}
             for col in TIMELINE_COLS:
-                if col not in df_all.columns:
-                    continue
                 raw_val = target_row.get(col, "")
                 date_str = "" if pd.isna(raw_val) else str(raw_val)
-                date_values[col] = st.text_input(f"{col}", value=date_str)
+                date_values[col] = st.text_input(f"{col}（选填）", value=date_str)
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -268,8 +266,9 @@ def _render_project_wizard(df: pd.DataFrame):
                 if col in df_new.columns:
                     df_new.loc[mask, col] = val
             for col, val in date_values.items():
-                if col in df_new.columns:
-                    df_new.loc[mask, col] = val
+                if col not in df_new.columns:
+                    df_new[col] = ""
+                df_new.loc[mask, col] = val
             save_to_db(df_new)
             if get_feishu_webhook_url():
                 modified_row = df_new.loc[mask].iloc[0]
@@ -338,7 +337,7 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown("**项目节点日期（全部选填）**")
         date_values = {}
         for col in TIMELINE_COLS:
-            date_values[col] = st.text_input(f"{col}", value="", key=f"add_{col}")
+            date_values[col] = st.text_input(f"{col}（选填）", value="", key=f"add_{col}")
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
 
