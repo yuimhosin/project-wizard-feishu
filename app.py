@@ -137,7 +137,7 @@ def _render_project_wizard(df: pd.DataFrame):
         园区列表 = sorted(df["园区"].dropna().astype(str).unique().tolist())
         园区列表 = [p for p in 园区列表 if p and str(p).strip() and str(p) != "nan"]
         园区选择 = st.multiselect(
-            "按园区筛选（选填，不选则显示全部）",
+            "先选择园区（选择后自动显示该园区下项目）",
             options=园区列表,
             default=[],
             key="wizard_search_园区",
@@ -188,7 +188,7 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
 
         with st.form("edit_project_form"):
-            st.caption("提示：保存后若有飞书 Webhook 配置（环境变量 FEISHU_WEBHOOK_URL 或 .streamlit/secrets.toml），将自动推送到飞书。")
+            st.caption("提示：保存后将自动推送到飞书。")
             st.markdown("**基础信息**")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -300,7 +300,7 @@ def _render_project_wizard(df: pd.DataFrame):
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
-        st.caption("提示：保存后若有飞书 Webhook 配置，将自动推送到飞书。")
+        st.caption("提示：保存后将自动推送到飞书。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -380,7 +380,7 @@ def _render_project_wizard(df: pd.DataFrame):
 def main():
     st.set_page_config(page_title="养老社区项目向导", page_icon="🏠", layout="wide")
     st.title("养老社区改良改造 - 项目新增/修改向导")
-    st.caption("支持项目录入、修改、删除，保存时默认推送到飞书（需配置 Webhook）。")
+    st.info("📤 支持项目录入、修改、删除，**保存时自动推送到飞书**")
 
     with st.sidebar:
         st.header("数据源")
@@ -405,7 +405,7 @@ def main():
                                     st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
                                 else:
                                     st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
-                                    st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                                    st.warning("飞书推送失败，请检查网络或配置。")
                             else:
                                 st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
                         else:
@@ -439,7 +439,7 @@ def main():
                                 if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（上传文件：{name}）"):
                                     st.success("已保存到 SQLite 并已推送至飞书。")
                                 else:
-                                    st.success("已保存到 SQLite。"); st.warning("飞书推送失败。")
+                                    st.success("已保存到 SQLite。"); st.warning("飞书推送失败，请检查配置。")
                             else:
                                 st.success("已保存到 SQLite。")
                             st.rerun()
