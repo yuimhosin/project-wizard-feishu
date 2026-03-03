@@ -115,7 +115,14 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 DATE_FORMAT = "YYYY-MM-DD"
-REQ_MARK = "* "
+REQ_SUFFIX = " *"  # 必填标记放在标签后：园区 *
+HELP_园区 = "请选择项目所在园区，必填"
+HELP_项目分级 = "一级为最高优先级，必填"
+HELP_项目分类 = "如品质提升、大修、安全等，必填"
+HELP_所属业态 = "如独立、护理、其他，必填"
+HELP_专业 = "如土建设施、供配电系统等，必填"
+HELP_项目名称 = "请填写项目名称，必填"
+HELP_预算金额 = "请填写预算金额，单位：万元，必填"
 # 下拉选项（可扩展，来自数据 + 预设）
 OPT_所属业态 = ["独立", "护理", "其他"]
 OPT_项目分级 = ["一级（最高级）", "二级", "三级"]
@@ -124,6 +131,9 @@ OPT_拟定承建组织 = ["不动产项目部", "社区分包", "社区负责"]
 OPT_总部重点关注 = ["是", "否", ""]
 专业大类 = ["土建设施", "供配电系统", "暖通/供冷系统", "弱电系统", "供排水系统", "电梯系统", "其它系统", "消防系统", "安防系统"]
 SENTINEL_DATE = date(2000, 1, 1)  # 表示未填写
+DATE_RANGE_MIN = date(2020, 1, 1)
+DATE_RANGE_MAX = date(2030, 12, 31)
+DATE_DEFAULT = date(2025, 1, 1)  # 默认从 2025 年开始选择
 
 def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> list:
     """从数据中提取唯一值 + 额外选项，用于下拉。"""
@@ -143,7 +153,7 @@ def _date_to_str(d) -> str:
     return str(d) if d else ""
 
 def _str_to_date(s):
-    """字符串转 date，空或无效则返回 SENTINEL_DATE。"""
+    """字符串转 date，空或无效则返回 SENTINEL_DATE。仅支持 2020-2030 年。"""
     if not s or (isinstance(s, str) and not str(s).strip()):
         return SENTINEL_DATE
     try:
@@ -151,11 +161,18 @@ def _str_to_date(s):
         if pd.isna(dt):
             return SENTINEL_DATE
         d = dt.date() if hasattr(dt, "date") else dt
-        if d.year < 2000:
+        if not (DATE_RANGE_MIN <= d <= DATE_RANGE_MAX):
             return SENTINEL_DATE
         return d
     except Exception:
         return SENTINEL_DATE
+
+
+def _get_default_node_date(existing_d: date = None) -> date:
+    """节点日期默认值：修改时已有且在范围内用已有；否则默认 2025-01-01。"""
+    if existing_d and existing_d != SENTINEL_DATE and DATE_RANGE_MIN <= existing_d <= DATE_RANGE_MAX:
+        return existing_d
+    return DATE_DEFAULT
 
 def _normalize_date(s) -> str:
     """将日期字符串规范为 YYYY-MM-DD 格式，无效则返回空。"""
@@ -249,15 +266,31 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown("---")
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
 
+        st.markdown("**项目节点**（先选择节点，再选择日期，支持 2020-2030 年）")
+        选择节点 = st.selectbox("选择要更新的项目节点", options=["（不更新节点）"] + list(TIMELINE_COLS), key="edit_node_select")
+        edit_selected_date = None
+        if 选择节点 != "（不更新节点）":
+            raw_val = target_row.get(选择节点, "")
+            existing_d = _str_to_date(raw_val)
+            default_d = _get_default_node_date(existing_d)
+            edit_selected_date = st.date_input(
+                f"「{选择节点}」日期",
+                value=default_d,
+                min_value=DATE_RANGE_MIN,
+                max_value=DATE_RANGE_MAX,
+                format="YYYY-MM-DD",
+                key="edit_date_picker",
+            )
+
         with st.form("edit_project_form"):
-            st.caption("提示：保存后将自动推送到飞书。")
+            st.caption("提示：保存后将自动推送到飞书。带 * 为必填项。")
             st.markdown("**基础信息**")
             c1, c2, c3 = st.columns(3)
             with c1:
                 园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
                 园区_options = [x for x in 园区_options if x]
                 园区默认 = str(target_row.get("园区", ""))
-                园区 = st.selectbox("园区", options=[""] + 园区_options, index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0)
+                园区 = st.selectbox("园区" + REQ_SUFFIX, options=[""] + 园区_options, index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0, help=HELP_园区)
             with c2:
                 区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
                 _v = str(target_row.get("所属区域", ""))
@@ -268,18 +301,18 @@ def _render_project_wizard(df: pd.DataFrame):
             with c3:
                 业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
                 _ev = str(target_row.get("所属业态", ""))
-                所属业态 = st.selectbox("所属业态", options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts and 业态_opts else 0)
+                所属业态 = st.selectbox("所属业态" + REQ_SUFFIX, options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts and 业态_opts else 0, help=HELP_所属业态)
 
             st.markdown("**项目属性**")
             c4, c5, c6 = st.columns(3)
             with c4:
                 分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
                 _lv = str(target_row.get("项目分级", ""))
-                项目分级 = st.selectbox("项目分级", options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts and 分级_opts else 0)
+                项目分级 = st.selectbox("项目分级" + REQ_SUFFIX, options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts and 分级_opts else 0, help=HELP_项目分级)
             with c5:
                 分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
                 _cv = str(target_row.get("项目分类", ""))
-                项目分类 = st.selectbox("项目分类", options=[""] + 分类_opts, index=分类_opts.index(_cv) + 1 if _cv in 分类_opts and 分类_opts else 0)
+                项目分类 = st.selectbox("项目分类" + REQ_SUFFIX, options=[""] + 分类_opts, index=分类_opts.index(_cv) + 1 if _cv in 分类_opts and 分类_opts else 0, help=HELP_项目分类)
             with c6:
                 承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
                 _bv = str(target_row.get("拟定承建组织", ""))
@@ -291,27 +324,20 @@ def _render_project_wizard(df: pd.DataFrame):
                 _zv = str(target_row.get("总部重点关注项目", ""))
                 总部重点关注项目 = st.selectbox("总部重点关注项目", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts and 总部_opts else 0)
             with c8:
-                拟定金额 = st.number_input("预算金额（万元）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
+                拟定金额 = st.number_input("预算金额（万元）" + REQ_SUFFIX, min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0, help=HELP_预算金额)
 
             st.markdown("**专业与名称**")
             c9, c10 = st.columns(2)
             with c9:
                 专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
                 _pv = str(target_row.get("专业", ""))
-                专业 = st.selectbox("专业", options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts and 专业_opts else 0)
+                专业 = st.selectbox("专业" + REQ_SUFFIX, options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts and 专业_opts else 0, help=HELP_专业)
             with c10:
                 分包_opts = _get_dropdown_options(df_all, "专业分包")
                 _sbv = str(target_row.get("专业分包", ""))
                 专业分包 = st.selectbox("专业分包", options=[""] + 分包_opts, index=分包_opts.index(_sbv) + 1 if _sbv in 分包_opts and 分包_opts else 0)
-            项目名称 = st.text_input("项目名称", value=str(target_row.get("项目名称", "")))
+            项目名称 = st.text_input("项目名称" + REQ_SUFFIX, value=str(target_row.get("项目名称", "")), help=HELP_项目名称)
             备注说明 = st.text_area("备注说明", value=str(target_row.get("备注说明", "")))
-
-            st.markdown("**项目节点日期**（选填，不填请保持 2000-01-01）")
-            date_values = {}
-            for col in TIMELINE_COLS:
-                raw_val = target_row.get(col, "")
-                d = _str_to_date(raw_val)
-                date_values[col] = st.date_input(col, value=d, format="YYYY-MM-DD")
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -331,48 +357,75 @@ def _render_project_wizard(df: pd.DataFrame):
             st.rerun()
 
         if submitted:
-            df_new = df_all.copy()
-            mask = df_new["序号"].astype(int) == seq_val
-            update_dict = {
-                "园区": 园区, "所属区域": 所属区域, "城市": 城市, "所属业态": 所属业态,
-                "项目分级": 项目分级, "项目分类": 项目分类, "拟定承建组织": 拟定承建组织,
-                "总部重点关注项目": 总部重点关注项目, "专业": 专业, "专业分包": 专业分包,
-                "项目名称": 项目名称, "备注说明": 备注说明, "拟定金额": 拟定金额,
-            }
-            for col, val in update_dict.items():
-                if col in df_new.columns:
-                    df_new.loc[mask, col] = val
-            for col, val in date_values.items():
-                if col not in df_new.columns:
-                    df_new[col] = ""
-                df_new.loc[mask, col] = _date_to_str(val)
-            save_to_db(df_new)
-            if get_feishu_webhook_url():
-                modified_row = df_new.loc[mask].iloc[0]
-                changes = []
-                for col in target_row.index:
-                    if col not in modified_row.index:
-                        continue
-                    ov = format_cell(target_row[col])
-                    nv = format_cell(modified_row[col])
-                    if ov != nv:
-                        changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
-                modified_details = [{"序号": seq_val, "变更项": changes}]
-                diff = {
-                    "deleted": [], "added": [], "modified": [row_to_dict(modified_row)],
-                    "modified_details": modified_details,
+            required_edit = ["园区", "项目分级", "项目分类", "所属业态", "专业", "项目名称"]
+            edit_vals = {"园区": 园区, "项目分级": 项目分级, "项目分类": 项目分类, "所属业态": 所属业态, "专业": 专业, "项目名称": 项目名称}
+            missing_edit = [k for k in required_edit if not str(edit_vals.get(k, "")).strip()]
+            if missing_edit:
+                st.error(f"以下字段为必填：{', '.join(missing_edit)}")
+            else:
+                date_values = {}
+                for col in TIMELINE_COLS:
+                    if 选择节点 == col and edit_selected_date is not None:
+                        date_values[col] = edit_selected_date
+                    else:
+                        raw_val = target_row.get(col, "")
+                        date_values[col] = _str_to_date(raw_val)
+                df_new = df_all.copy()
+                mask = df_new["序号"].astype(int) == seq_val
+                update_dict = {
+                    "园区": 园区, "所属区域": 所属区域, "城市": 城市, "所属业态": 所属业态,
+                    "项目分级": 项目分级, "项目分类": 项目分类, "拟定承建组织": 拟定承建组织,
+                    "总部重点关注项目": 总部重点关注项目, "专业": 专业, "专业分包": 专业分包,
+                    "项目名称": 项目名称, "备注说明": 备注说明, "拟定金额": 拟定金额,
                 }
-                payload = build_feishu_payload_from_diff(diff, len(df_new), source="向导修改")
-                push_to_feishu(payload=payload)
-            st.success("已保存修改。")
-            st.rerun()
+                for col, val in update_dict.items():
+                    if col in df_new.columns:
+                        df_new.loc[mask, col] = val
+                for col, val in date_values.items():
+                    if col not in df_new.columns:
+                        df_new[col] = ""
+                    df_new.loc[mask, col] = _date_to_str(val)
+                save_to_db(df_new)
+                if get_feishu_webhook_url():
+                    modified_row = df_new.loc[mask].iloc[0]
+                    changes = []
+                    for col in target_row.index:
+                        if col not in modified_row.index:
+                            continue
+                        ov = format_cell(target_row[col])
+                        nv = format_cell(modified_row[col])
+                        if ov != nv:
+                            changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+                    modified_details = [{"序号": seq_val, "变更项": changes}]
+                    diff = {
+                        "deleted": [], "added": [], "modified": [row_to_dict(modified_row)],
+                        "modified_details": modified_details,
+                    }
+                    payload = build_feishu_payload_from_diff(diff, len(df_new), source="向导修改")
+                    push_to_feishu(payload=payload)
+                st.success("已保存修改。")
+                st.rerun()
         return
 
     # ---------- 新增项目 ----------
     st.markdown("### 新增项目")
     df_all = _ensure_project_columns(df_all)
     next_seq = _get_next_序号(df_all)
-    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称"]
+    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "专业", "项目名称"]
+
+    st.markdown("**项目节点**（先选择节点，再选择日期，支持 2020-2030 年）")
+    选择节点 = st.selectbox("选择要更新的项目节点", options=["（不更新节点）"] + list(TIMELINE_COLS), key="add_node_select")
+    add_selected_date = None
+    if 选择节点 != "（不更新节点）":
+        default_d = _get_default_node_date(None)
+        add_selected_date = st.date_input(
+            f"「{选择节点}」日期",
+            value=default_d,
+            min_value=DATE_RANGE_MIN,
+            max_value=DATE_RANGE_MAX,
+            format="YYYY-MM-DD",
+            key="add_date_picker",
+        )
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
@@ -382,7 +435,7 @@ def _render_project_wizard(df: pd.DataFrame):
         with c1:
             parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
             parks = [x for x in parks if x]
-            园区 = st.selectbox(REQ_MARK + "园区", options=[""] + parks)
+            园区 = st.selectbox("园区" + REQ_SUFFIX, options=[""] + parks, help=HELP_园区)
         with c2:
             区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
             所属区域 = st.selectbox("所属区域", options=[""] + 区域_opts)
@@ -393,18 +446,18 @@ def _render_project_wizard(df: pd.DataFrame):
         c4, c5, c6 = st.columns(3)
         with c4:
             业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
-            所属业态 = st.selectbox(REQ_MARK + "所属业态", options=[""] + 业态_opts)
+            所属业态 = st.selectbox("所属业态" + REQ_SUFFIX, options=[""] + 业态_opts, help=HELP_所属业态)
         with c5:
             分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
-            项目分级 = st.selectbox(REQ_MARK + "项目分级", options=[""] + 分级_opts)
+            项目分级 = st.selectbox("项目分级" + REQ_SUFFIX, options=[""] + 分级_opts, help=HELP_项目分级)
         with c6:
             分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
-            项目分类 = st.selectbox(REQ_MARK + "项目分类", options=[""] + 分类_opts)
+            项目分类 = st.selectbox("项目分类" + REQ_SUFFIX, options=[""] + 分类_opts, help=HELP_项目分类)
 
         c7, c8 = st.columns(2)
         with c7:
             承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
-            拟定承建组织 = st.selectbox(REQ_MARK + "拟定承建组织", options=[""] + 承建_opts)
+            拟定承建组织 = st.selectbox("拟定承建组织", options=[""] + 承建_opts)
         with c8:
             总部_opts = _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注)
             总部重点关注项目 = st.selectbox("总部重点关注项目", options=[""] + [x for x in 总部_opts if x])
@@ -412,19 +465,14 @@ def _render_project_wizard(df: pd.DataFrame):
         c9, c10 = st.columns(2)
         with c9:
             专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
-            专业 = st.selectbox(REQ_MARK + "专业", options=[""] + 专业_opts)
+            专业 = st.selectbox("专业" + REQ_SUFFIX, options=[""] + 专业_opts, help=HELP_专业)
         with c10:
             分包_opts = _get_dropdown_options(df_all, "专业分包")
             专业分包 = st.selectbox("专业分包", options=[""] + 分包_opts)
 
-        项目名称 = st.text_input(REQ_MARK + "项目名称")
+        项目名称 = st.text_input("项目名称" + REQ_SUFFIX, help=HELP_项目名称)
         备注说明 = st.text_area("备注说明")
-        拟定金额 = st.number_input("预算金额（万元）", min_value=0.0, value=0.0, step=1.0)
-
-        st.markdown("**项目节点日期**（选填，不填请保持 2000-01-01）")
-        date_values = {}
-        for col in TIMELINE_COLS:
-            date_values[col] = st.date_input(col, value=SENTINEL_DATE, format="YYYY-MM-DD", key=f"add_{col}")
+        拟定金额 = st.number_input("预算金额（万元）" + REQ_SUFFIX, min_value=0.0, value=0.0, step=1.0, help=HELP_预算金额)
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
 
@@ -448,8 +496,11 @@ def _render_project_wizard(df: pd.DataFrame):
 
         token = str(uuid.uuid4())
         form_dict["上传凭证"] = token
-        for col, val in date_values.items():
-            form_dict[col] = _date_to_str(val)
+        for col in TIMELINE_COLS:
+            if 选择节点 == col and add_selected_date is not None:
+                form_dict[col] = _date_to_str(add_selected_date)
+            else:
+                form_dict[col] = _date_to_str(SENTINEL_DATE)
 
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
