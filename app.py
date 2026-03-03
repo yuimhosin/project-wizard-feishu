@@ -6,6 +6,7 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+from datetime import date, datetime
 import tempfile
 import os
 import sqlite3
@@ -114,6 +115,47 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 DATE_FORMAT = "YYYY-MM-DD"
+REQ_MARK = "* "
+# 下拉选项（可扩展，来自数据 + 预设）
+OPT_所属业态 = ["独立", "护理", "其他"]
+OPT_项目分级 = ["一级（最高级）", "二级", "三级"]
+OPT_项目分类 = ["品质提升", "大修", "安全", "运营需求", "节能改造", "智能化提升", "金额10万以上的常规维修", "金额10万以上的房态更新", "其他改造"]
+OPT_拟定承建组织 = ["不动产项目部", "社区分包", "社区负责"]
+OPT_总部重点关注 = ["是", "否", ""]
+专业大类 = ["土建设施", "供配电系统", "暖通/供冷系统", "弱电系统", "供排水系统", "电梯系统", "其它系统", "消防系统", "安防系统"]
+SENTINEL_DATE = date(2000, 1, 1)  # 表示未填写
+
+def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> list:
+    """从数据中提取唯一值 + 额外选项，用于下拉。"""
+    opts = []
+    if col in df.columns:
+        opts = sorted(df[col].dropna().astype(str).unique().tolist())
+    if extras:
+        opts = sorted(set(opts) | set(extras))
+    return [x for x in opts if x and str(x).strip() != "nan"]
+
+def _date_to_str(d) -> str:
+    """日期转 YYYY-MM-DD，SENTINEL_DATE 或 None 转为空。"""
+    if d is None or (hasattr(d, "year") and d.year == 2000 and d.month == 1 and d.day == 1):
+        return ""
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    return str(d) if d else ""
+
+def _str_to_date(s):
+    """字符串转 date，空或无效则返回 SENTINEL_DATE。"""
+    if not s or (isinstance(s, str) and not str(s).strip()):
+        return SENTINEL_DATE
+    try:
+        dt = pd.to_datetime(s, errors="coerce", format="mixed")
+        if pd.isna(dt):
+            return SENTINEL_DATE
+        d = dt.date() if hasattr(dt, "date") else dt
+        if d.year < 2000:
+            return SENTINEL_DATE
+        return d
+    except Exception:
+        return SENTINEL_DATE
 
 def _normalize_date(s) -> str:
     """将日期字符串规范为 YYYY-MM-DD 格式，无效则返回空。"""
@@ -191,7 +233,10 @@ def _render_project_wizard(df: pd.DataFrame):
         st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
         display_cols = ["序号", "园区", "项目名称", "项目分级", "拟定金额"]
         display_cols = [c for c in display_cols if c in candidates.columns]
-        st.dataframe(candidates[display_cols].head(50), use_container_width=True, hide_index=True)
+        disp_df = candidates[display_cols].head(50).copy()
+        if "拟定金额" in disp_df.columns:
+            disp_df = disp_df.rename(columns={"拟定金额": "预算金额"})
+        st.dataframe(disp_df, use_container_width=True, hide_index=True)
 
         seq_choices = sorted(candidates["序号"].dropna().astype(int).unique().tolist())
         def _fmt(seq):
@@ -210,48 +255,63 @@ def _render_project_wizard(df: pd.DataFrame):
             c1, c2, c3 = st.columns(3)
             with c1:
                 园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+                园区_options = [x for x in 园区_options if x]
                 园区默认 = str(target_row.get("园区", ""))
-                园区 = st.selectbox(
-                    "园区（选填）",
-                    options=[""] + 园区_options,
-                    index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
-                )
+                园区 = st.selectbox("园区", options=[""] + 园区_options, index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0)
             with c2:
-                所属区域 = st.text_input("所属区域（选填）", value=str(target_row.get("所属区域", "")))
-                城市 = st.text_input("所在城市（选填）", value=str(target_row.get("城市", "")))
+                区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+                _v = str(target_row.get("所属区域", ""))
+                所属区域 = st.selectbox("所属区域", options=[""] + 区域_opts, index=区域_opts.index(_v) + 1 if _v in 区域_opts and 区域_opts else 0)
+                城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+                _cv = str(target_row.get("城市", ""))
+                城市 = st.selectbox("所在城市", options=[""] + 城市_opts, index=城市_opts.index(_cv) + 1 if _cv in 城市_opts and 城市_opts else 0)
             with c3:
-                所属业态 = st.text_input("所属业态（选填）", value=str(target_row.get("所属业态", "")))
+                业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+                _ev = str(target_row.get("所属业态", ""))
+                所属业态 = st.selectbox("所属业态", options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts and 业态_opts else 0)
 
             st.markdown("**项目属性**")
             c4, c5, c6 = st.columns(3)
             with c4:
-                项目分级 = st.text_input("项目分级（选填）", value=str(target_row.get("项目分级", "")))
+                分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+                _lv = str(target_row.get("项目分级", ""))
+                项目分级 = st.selectbox("项目分级", options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts and 分级_opts else 0)
             with c5:
-                项目分类 = st.text_input("项目分类（选填）", value=str(target_row.get("项目分类", "")))
+                分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+                _cv = str(target_row.get("项目分类", ""))
+                项目分类 = st.selectbox("项目分类", options=[""] + 分类_opts, index=分类_opts.index(_cv) + 1 if _cv in 分类_opts and 分类_opts else 0)
             with c6:
-                拟定承建组织 = st.text_input("拟定承建组织（选填）", value=str(target_row.get("拟定承建组织", "")))
+                承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+                _bv = str(target_row.get("拟定承建组织", ""))
+                拟定承建组织 = st.selectbox("拟定承建组织", options=[""] + 承建_opts, index=承建_opts.index(_bv) + 1 if _bv in 承建_opts and 承建_opts else 0)
 
             c7, c8 = st.columns(2)
             with c7:
-                总部重点关注项目 = st.text_input("总部重点关注项目（选填）", value=str(target_row.get("总部重点关注项目", "")))
+                总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
+                _zv = str(target_row.get("总部重点关注项目", ""))
+                总部重点关注项目 = st.selectbox("总部重点关注项目", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts and 总部_opts else 0)
             with c8:
-                拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
+                拟定金额 = st.number_input("预算金额（万元）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
 
             st.markdown("**专业与名称**")
             c9, c10 = st.columns(2)
             with c9:
-                专业 = st.text_input("专业（选填）", value=str(target_row.get("专业", "")))
+                专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+                _pv = str(target_row.get("专业", ""))
+                专业 = st.selectbox("专业", options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts and 专业_opts else 0)
             with c10:
-                专业分包 = st.text_input("专业分包（选填）", value=str(target_row.get("专业分包", "")))
-            项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
-            备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
+                分包_opts = _get_dropdown_options(df_all, "专业分包")
+                _sbv = str(target_row.get("专业分包", ""))
+                专业分包 = st.selectbox("专业分包", options=[""] + 分包_opts, index=分包_opts.index(_sbv) + 1 if _sbv in 分包_opts and 分包_opts else 0)
+            项目名称 = st.text_input("项目名称", value=str(target_row.get("项目名称", "")))
+            备注说明 = st.text_area("备注说明", value=str(target_row.get("备注说明", "")))
 
-            st.markdown(f"**项目节点日期**（格式：{DATE_FORMAT}，选填）")
+            st.markdown("**项目节点日期**（选填，不填请保持 2000-01-01）")
             date_values = {}
             for col in TIMELINE_COLS:
                 raw_val = target_row.get(col, "")
-                date_str = _normalize_date(raw_val) if raw_val and not pd.isna(raw_val) else ""
-                date_values[col] = st.text_input(col, value=date_str, placeholder="如：2026-01-15")
+                d = _str_to_date(raw_val)
+                date_values[col] = st.date_input(col, value=d, format="YYYY-MM-DD")
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -285,7 +345,7 @@ def _render_project_wizard(df: pd.DataFrame):
             for col, val in date_values.items():
                 if col not in df_new.columns:
                     df_new[col] = ""
-                df_new.loc[mask, col] = _normalize_date(val)
+                df_new.loc[mask, col] = _date_to_str(val)
             save_to_db(df_new)
             if get_feishu_webhook_url():
                 modified_row = df_new.loc[mask].iloc[0]
@@ -316,45 +376,55 @@ def _render_project_wizard(df: pd.DataFrame):
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
-        st.caption("提示：保存后将自动推送到飞书。")
+        st.caption("提示：保存后将自动推送到飞书。带 * 为必填项。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
             parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
-            园区 = st.selectbox("园区（必填）", options=[""] + parks)
+            parks = [x for x in parks if x]
+            园区 = st.selectbox(REQ_MARK + "园区", options=[""] + parks)
         with c2:
-            所属区域 = st.text_input("所属区域（选填）")
+            区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+            所属区域 = st.selectbox("所属区域", options=[""] + 区域_opts)
         with c3:
-            城市 = st.text_input("所在城市（选填）")
+            城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+            城市 = st.selectbox("所在城市", options=[""] + 城市_opts)
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            所属业态 = st.text_input("所属业态（必填，例如：独立 / 护理等）")
+            业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+            所属业态 = st.selectbox(REQ_MARK + "所属业态", options=[""] + 业态_opts)
         with c5:
-            项目分级 = st.text_input("项目分级（必填，例如：一级/二级/三级）")
+            分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+            项目分级 = st.selectbox(REQ_MARK + "项目分级", options=[""] + 分级_opts)
         with c6:
-            项目分类 = st.text_input("项目分类（必填，例如：品质提升 / 大修等）")
+            分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+            项目分类 = st.selectbox(REQ_MARK + "项目分类", options=[""] + 分类_opts)
 
         c7, c8 = st.columns(2)
         with c7:
-            拟定承建组织 = st.text_input("拟定承建组织（必填，例如：项目部 / 社区分包）")
+            承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+            拟定承建组织 = st.selectbox(REQ_MARK + "拟定承建组织", options=[""] + 承建_opts)
         with c8:
-            总部重点关注项目 = st.text_input("总部重点关注项目（选填）")
+            总部_opts = _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注)
+            总部重点关注项目 = st.selectbox("总部重点关注项目", options=[""] + [x for x in 总部_opts if x])
 
         c9, c10 = st.columns(2)
         with c9:
-            专业 = st.text_input("专业（必填，例如：土建设施 / 供配电等）")
+            专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+            专业 = st.selectbox(REQ_MARK + "专业", options=[""] + 专业_opts)
         with c10:
-            专业分包 = st.text_input("专业分包（选填，例如：土建-结构）")
+            分包_opts = _get_dropdown_options(df_all, "专业分包")
+            专业分包 = st.selectbox("专业分包", options=[""] + 分包_opts)
 
-        项目名称 = st.text_input("项目名称（必填）")
-        备注说明 = st.text_area("备注说明（选填）")
-        拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=0.0, step=1.0)
+        项目名称 = st.text_input(REQ_MARK + "项目名称")
+        备注说明 = st.text_area("备注说明")
+        拟定金额 = st.number_input("预算金额（万元）", min_value=0.0, value=0.0, step=1.0)
 
-        st.markdown(f"**项目节点日期**（格式：{DATE_FORMAT}，选填）")
+        st.markdown("**项目节点日期**（选填，不填请保持 2000-01-01）")
         date_values = {}
         for col in TIMELINE_COLS:
-            date_values[col] = st.text_input(col, value="", placeholder="如：2026-01-15", key=f"add_{col}")
+            date_values[col] = st.date_input(col, value=SENTINEL_DATE, format="YYYY-MM-DD", key=f"add_{col}")
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
 
@@ -379,7 +449,7 @@ def _render_project_wizard(df: pd.DataFrame):
         token = str(uuid.uuid4())
         form_dict["上传凭证"] = token
         for col, val in date_values.items():
-            form_dict[col] = _normalize_date(val)
+            form_dict[col] = _date_to_str(val)
 
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
