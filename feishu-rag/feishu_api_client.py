@@ -147,6 +147,29 @@ def list_wiki_space_docs(space_id: str) -> list:
     return result
 
 
+def subscribe_drive_file(file_token: str, file_type: str = "bitable") -> bool:
+    """
+    订阅云文档事件，变更时飞书会推送到配置的 Request URL。
+    file_type: doc|docx|sheet|bitable
+    注意：需在飞书开放平台事件订阅中已添加 drive.file.bitable_record_changed_v1 等事件
+    """
+    token = get_tenant_access_token()
+    if not token:
+        return False
+    url = f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/subscribe?file_type={file_type}"
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("code") == 0
+    except Exception:
+        return False
+
+
 def get_bitable_raw_content(app_token: str, table_id: str) -> tuple[Optional[str], Optional[str]]:
     """
     获取多维表格内容，转为纯文本。

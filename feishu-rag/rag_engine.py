@@ -48,6 +48,9 @@ def _get_llm_client():
         return None
 
 
+_rag_singleton = None
+
+
 class RAGEngine:
     """RAG engine: FAISS + local embedding + DeepSeek. Rebuild index on doc update."""
 
@@ -55,6 +58,14 @@ class RAGEngine:
         self.db_path = db_path or VECTOR_DB_PATH
         self._db = None
         self._contents_file = Path(self.db_path) / "doc_contents.json"
+
+    @classmethod
+    def get_cached(cls, db_path: str = None):
+        """获取缓存的 RAGEngine 实例，避免重复加载 FAISS"""
+        global _rag_singleton
+        if _rag_singleton is None:
+            _rag_singleton = cls(db_path)
+        return _rag_singleton
 
     def _get_embeddings(self):
         from model_manager import get_embedding_model
@@ -144,6 +155,10 @@ class RAGEngine:
         self._rebuild_db(contents)
         self._save_db()
 
+    def invalidate_index(self):
+        """清除缓存的向量索引，下次查询时从 doc_contents 重建"""
+        self._db = None
+
     def search(self, query: str, top_k: int = None) -> List[dict]:
         """Retrieve relevant chunks"""
         k = top_k or TOP_K
@@ -168,8 +183,11 @@ class RAGEngine:
     def query(self, question: str, top_k: int = None) -> str:
         """RAG: retrieve + DeepSeek generate。统计分析类问题走 bitable 直接统计"""
         q = question.strip()
-        # 统计分析类：直接从多维表格拉取数据做统计，不走 RAG
-        if any(kw in q for kw in ("统计", "分析", "哪个机构", "上报最积极", "机构排名", "上报数量")):
+        # 统计分析类、具体事件关键词：直接从多维表格拉取并筛选，不走向量检索
+        if any(kw in q for kw in (
+            "统计", "分析", "哪个机构", "上报最积极", "机构排名", "上报数量",
+            "电梯", "漏水", "渗漏", "特种设备", "困人", "管道", "消防", "人身安全", "基础设施"
+        )):
             try:
                 from stats_analysis import get_records, format_stats_report
                 recs = get_records()

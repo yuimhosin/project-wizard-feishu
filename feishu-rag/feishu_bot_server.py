@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from config import FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_DOC_IDS
-from feishu_api_client import get_tenant_access_token
+from feishu_api_client import get_tenant_access_token, subscribe_drive_file
 from feishu_doc_sync import sync_documents, run_sync_loop
 from rag_engine import RAGEngine
 
@@ -89,20 +89,14 @@ def _extract_question(text: str, bot_name: str = "") -> str:
     return text.strip()
 
 
-# 全局 RAG 引擎
-_rag: RAGEngine = None
-
-
 def _get_rag() -> RAGEngine:
-    global _rag
-    if _rag is None:
-        _rag = RAGEngine()
-    return _rag
+    return RAGEngine.get_cached()
 
 
 def _on_doc_update(doc_id: str, content: str, title: str):
-    """文档更新时，更新向量库"""
-    _get_rag().add_document(doc_id, content, title)
+    """文档更新时，清洗后更新向量库"""
+    from clean_timestamps import clean_content
+    _get_rag().add_document(doc_id, clean_content(content), title)
 
 
 class FeishuEventHandler(BaseHTTPRequestHandler):
@@ -170,14 +164,33 @@ class FeishuEventHandler(BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
+def _handle_drive_event(raw: dict):
+    """处理云文档变更事件：触发 RAG 同步"""
+    event_type = raw.get("header", {}).get("event_type") or raw.get("event", {}).get("type") or ""
+    if "drive.file.bitable_record_changed" in event_type or "drive.file.edit" in event_type:
+        print(f"[FEISHU] 收到文档变更事件 {event_type}，触发同步", flush=True)
+        try:
+            sync_documents(on_update=_on_doc_update)
+            print("[FEISHU] 文档同步完成", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[FEISHU] 文档同步失败: {e}\n{traceback.format_exc()}", flush=True)
+
+
 def _handle_event(raw: dict):
-    """处理事件：接收消息 -> RAG 回答 -> 回复"""
+    """处理事件：接收消息 -> RAG 回答；云文档变更 -> 触发同步"""
     typ = raw.get("type")
     if typ == "url_verification":
         return
 
     # 支持 schema 1.0/2.0，以及 v1/v2 事件
     event_type = raw.get("header", {}).get("event_type") or raw.get("event", {}).get("type") or ""
+
+    # 云文档变更：多维表格/文档编辑 -> 实时同步
+    if "drive.file" in event_type:
+        _handle_drive_event(raw)
+        return
+
     if "im.message.receive" not in event_type:
         print(f"[FEISHU] skip event_type={event_type}")
         return
@@ -219,12 +232,32 @@ def _handle_event(raw: dict):
     print(f"[FEISHU] reply sent ok={ok}")
 
 
+def _subscribe_drive_files():
+    """订阅配置的云文档事件，变更时飞书推送触发实时同步"""
+    if not os.getenv("FEISHU_DRIVE_SUBSCRIBE", "1").strip() in ("1", "true", "yes"):
+        return
+    for item in FEISHU_DOC_IDS:
+        if not item or len(item) != 2:
+            continue
+        source, doc_id = item
+        if source == "bitable":
+            app_token, _ = doc_id if isinstance(doc_id, tuple) else ("", "")
+            if app_token and subscribe_drive_file(app_token, "bitable"):
+                print(f"[FEISHU] 已订阅多维表格 {app_token[:12]}... 事件", flush=True)
+            elif app_token:
+                print(f"[FEISHU] 订阅多维表格失败（需应用为文档拥有者/管理员）", flush=True)
+        elif source in ("doc", "docx"):
+            if isinstance(doc_id, str) and doc_id and subscribe_drive_file(doc_id, source):
+                print(f"[FEISHU] 已订阅文档 {doc_id[:12]}... 事件", flush=True)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="飞书 RAG 机器人服务")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--no-sync-loop", action="store_true", help="不启动后台文档同步")
+    parser.add_argument("--no-drive-subscribe", action="store_true", help="不订阅云文档事件")
     args = parser.parse_args()
 
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
@@ -239,6 +272,10 @@ def main():
     print("正在同步飞书文档...")
     sync_documents(on_update=_on_doc_update)
     print("文档同步完成")
+
+    # 订阅云文档事件（变更时实时同步）
+    if not args.no_drive_subscribe:
+        _subscribe_drive_files()
 
     if not args.no_sync_loop:
         run_sync_loop(on_update=_on_doc_update)
