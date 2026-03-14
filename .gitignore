@@ -28,9 +28,11 @@ dist/
 *.sqlite
 *.sqlite3
 
-# 显式上传的报表（不随 git 提交，默认数据用 改良改造报表-V4-sample.csv）
+# 显式上传的报表（不随 git 提交）
 改良改造报表-V4.csv
 改良改造报表-示例.csv
+# 默认数据明文（加密版 .enc 随 git 提交）
+改良改造报表-V4-sample.csv
 
 # 飞书 RAG 向量库（含同步的文档内容，勿提交）
 feishu-rag/vector_db/

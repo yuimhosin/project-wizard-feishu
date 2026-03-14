@@ -152,6 +152,31 @@ def _normalize_loaded_df(df: pd.DataFrame, 园区名: str = None, default_园区
     return df
 
 
+def _load_sample_csv(path: Path) -> pd.DataFrame:
+    """加载改良改造报表-V4-sample.csv（单行表头，用于 git 内嵌默认数据）。支持 .csv 或 .csv.enc。"""
+    path = Path(path)
+    if path.suffix == ".enc":
+        from bundled_data_crypto import load_decrypted_csv
+        content = load_decrypted_csv(path)
+        import io
+        df = pd.read_csv(io.StringIO(content), dtype=str, keep_default_na=False)
+    else:
+        for enc in ("utf-8-sig", "utf-8", "gbk", "gb2312"):
+            try:
+                df = pd.read_csv(path, encoding=enc, dtype=str, keep_default_na=False)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            raise ValueError("无法识别文件编码")
+    if df.empty:
+        return df
+    df.columns = [str(c).strip().strip("\ufeff") for c in df.columns]
+    if "专业细分" in df.columns and "专业分包" not in df.columns:
+        df["专业分包"] = df["专业细分"]
+    return _normalize_loaded_df(df, 园区名=None, default_园区_from=path.stem)
+
+
 def _load_flat_progress_csv(path: Path) -> pd.DataFrame:
     """
     加载已预处理好的长表 CSV（如工作簿2.csv、改良改造报表-V4.csv）。
@@ -282,11 +307,13 @@ def load_single_csv(path: str, 园区名: str = None) -> pd.DataFrame:
     若未传入 园区名，则从文件名中尝试解析（如含「燕园」则取燕园）。
     """
     path = Path(path)
-    if not path.suffix.lower() == ".csv":
-        raise ValueError("仅支持 .csv 文件")
-    # 特殊处理：工作簿2.csv、改良改造报表-V4.csv 等已预处理好的长表 CSV，第一行即为完整表头
+    if path.suffix.lower() not in (".csv", ".enc") and not path.name.endswith(".csv.enc"):
+        raise ValueError("仅支持 .csv 或 .csv.enc 文件")
+    # 特殊处理：工作簿2.csv、改良改造报表-V4.csv、改良改造报表-V4-sample.csv 等已预处理好的长表 CSV
     if path.name == "工作簿2.csv" or path.name == "改良改造报表-V4.csv":
         return _load_flat_progress_csv(path)
+    if path.name == "改良改造报表-V4-sample.csv" or path.name == "改良改造报表-V4-sample.csv.enc":
+        return _load_sample_csv(path)
     names, encoding = _parse_header(str(path))
     # 时间节点列统一为简称（含「验收(社区结算)」「验收(社区需求完成交付)」等）
     for i, n in enumerate(names):
