@@ -67,6 +67,23 @@ DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
     "电梯系统", "其它系统", "消防系统", "安防系统"
 ]
 
+# 下拉选项预设（用于新增/修改向导）
+OPT_所属业态 = ["独立", "护理", "其他"]
+OPT_项目分级 = ["一级（最高级）", "二级", "三级"]
+OPT_项目分类 = ["品质提升", "大修", "安全", "运营需求", "节能改造", "智能化提升", "金额10万以上的常规维修", "金额10万以上的房态更新", "其他改造"]
+OPT_拟定承建组织 = ["不动产项目部", "社区分包", "社区负责"]
+OPT_总部重点关注 = ["是", "否"]
+
+
+def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> list:
+    """从数据中提取唯一值 + 额外选项，用于下拉。"""
+    opts = []
+    if col in df.columns:
+        opts = sorted(df[col].dropna().astype(str).unique().tolist())
+    if extras:
+        opts = sorted(set(opts) | set(extras))
+    return [x for x in opts if x and str(x).strip() != "nan"]
+
 # ---------- 团队共享数据：SQLite 存储 ----------
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
 
@@ -5017,19 +5034,60 @@ def _render_project_wizard(df: pd.DataFrame):
     mode = st.radio("操作类型", ["新增项目", "修改已有项目"], horizontal=True)
 
     if mode == "修改已有项目":
-        st.markdown("### 步骤 1：查找要修改的项目")
-        col1, col2 = st.columns(2)
-        with col1:
-            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
-        with col2:
-            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
+        st.markdown("### 步骤 1：筛选要修改的项目")
+        st.caption("先按园区筛选，再按其他条件缩小范围。支持多选，不选表示不限制。")
 
-        target_row = None
-        if not seq_input.strip() and not name_kw.strip():
-            st.info("请先输入序号或项目名称关键词，然后回车进行查找。")
+        candidates = df_raw.copy()
+        parks_list = sorted(df_raw["园区"].dropna().astype(str).unique().tolist())
+        parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
+
+        园区选择 = st.multiselect("园区*（至少选一个）", options=parks_list, default=parks_list[:1] if parks_list else [])
+        if 园区选择:
+            candidates = candidates[candidates["园区"].astype(str).isin(园区选择)]
+        else:
+            st.warning("请至少选择一个园区。")
             return
 
-        candidates = df_raw
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            专业分包选项 = _get_dropdown_options(candidates, "专业分包")
+            专业分包选择 = st.multiselect("专业分包（可选）", options=专业分包选项, default=[])
+        with col_f2:
+            业态选项 = _get_dropdown_options(candidates, "所属业态", OPT_所属业态)
+            业态选择 = st.multiselect("所属业态（可选）", options=业态选项, default=[])
+        with col_f3:
+            分级选项 = _get_dropdown_options(candidates, "项目分级", OPT_项目分级)
+            分级选择 = st.multiselect("项目分级（可选）", options=分级选项, default=[])
+
+        col_f4, col_f5, col_f6 = st.columns(3)
+        with col_f4:
+            分类选项 = _get_dropdown_options(candidates, "项目分类", OPT_项目分类)
+            分类选择 = st.multiselect("项目分类（可选）", options=分类选项, default=[])
+        with col_f5:
+            承建选项 = _get_dropdown_options(candidates, "拟定承建组织", OPT_拟定承建组织)
+            承建选择 = st.multiselect("拟定承建组织（可选）", options=承建选项, default=[])
+        with col_f6:
+            专业选项 = _get_dropdown_options(candidates, "专业", 专业大类)
+            专业选择 = st.multiselect("专业（可选）", options=专业选项, default=[])
+
+        if 专业分包选择:
+            candidates = candidates[candidates["专业分包"].astype(str).isin(专业分包选择)]
+        if 业态选择:
+            candidates = candidates[candidates["所属业态"].astype(str).isin(业态选择)]
+        if 分级选择:
+            candidates = candidates[candidates["项目分级"].astype(str).isin(分级选择)]
+        if 分类选择:
+            candidates = candidates[candidates["项目分类"].astype(str).isin(分类选择)]
+        if 承建选择:
+            candidates = candidates[candidates["拟定承建组织"].astype(str).isin(承建选择)]
+        if 专业选择:
+            candidates = candidates[candidates["专业"].astype(str).isin(专业选择)]
+
+        col_s, col_n = st.columns(2)
+        with col_s:
+            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
+        with col_n:
+            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
         if seq_input.strip():
             try:
                 seq_val = int(float(seq_input.strip()))
@@ -5069,32 +5127,50 @@ def _render_project_wizard(df: pd.DataFrame):
                     index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
                 )
             with c2:
-                所属区域 = st.text_input("所属区域（选填）", value=str(target_row.get("所属区域", "")))
-                城市 = st.text_input("所在城市（选填）", value=str(target_row.get("城市", "")))
+                区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+                _v = str(target_row.get("所属区域", ""))
+                所属区域 = st.selectbox("所属区域（选填）", options=[""] + 区域_opts, index=区域_opts.index(_v) + 1 if _v in 区域_opts else 0)
+                城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+                _cv = str(target_row.get("城市", ""))
+                城市 = st.selectbox("所在城市（选填）", options=[""] + 城市_opts, index=城市_opts.index(_cv) + 1 if _cv in 城市_opts else 0)
             with c3:
-                所属业态 = st.text_input("所属业态（选填）", value=str(target_row.get("所属业态", "")))
+                业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+                _ev = str(target_row.get("所属业态", ""))
+                所属业态 = st.selectbox("所属业态（选填）", options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts else 0)
 
             st.markdown("**项目属性**")
             c4, c5, c6 = st.columns(3)
             with c4:
-                项目分级 = st.text_input("项目分级（选填）", value=str(target_row.get("项目分级", "")))
+                分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+                _lv = str(target_row.get("项目分级", ""))
+                项目分级 = st.selectbox("项目分级（选填）", options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts else 0)
             with c5:
-                项目分类 = st.text_input("项目分类（选填）", value=str(target_row.get("项目分类", "")))
+                分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+                _cv2 = str(target_row.get("项目分类", ""))
+                项目分类 = st.selectbox("项目分类（选填）", options=[""] + 分类_opts, index=分类_opts.index(_cv2) + 1 if _cv2 in 分类_opts else 0)
             with c6:
-                拟定承建组织 = st.text_input("拟定承建组织（选填）", value=str(target_row.get("拟定承建组织", "")))
+                承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+                _bv = str(target_row.get("拟定承建组织", ""))
+                拟定承建组织 = st.selectbox("拟定承建组织（选填）", options=[""] + 承建_opts, index=承建_opts.index(_bv) + 1 if _bv in 承建_opts else 0)
 
             c7, c8 = st.columns(2)
             with c7:
-                总部重点关注项目 = st.text_input("总部重点关注项目（选填）", value=str(target_row.get("总部重点关注项目", "")))
+                总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
+                _zv = str(target_row.get("总部重点关注项目", ""))
+                总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts else 0)
             with c8:
                 拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
 
             st.markdown("**专业与名称**")
             c9, c10 = st.columns(2)
             with c9:
-                专业 = st.text_input("专业（选填）", value=str(target_row.get("专业", "")))
+                专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+                _pv = str(target_row.get("专业", ""))
+                专业 = st.selectbox("专业（选填）", options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts else 0)
             with c10:
-                专业分包 = st.text_input("专业分包（选填）", value=str(target_row.get("专业分包", "")))
+                分包_opts = _get_dropdown_options(df_all, "专业分包")
+                _sbv = str(target_row.get("专业分包", ""))
+                专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts, index=分包_opts.index(_sbv) + 1 if _sbv in 分包_opts else 0)
             项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
             备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
 
@@ -5186,33 +5262,42 @@ def _render_project_wizard(df: pd.DataFrame):
         c1, c2, c3 = st.columns(3)
         with c1:
             parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
-            园区 = st.selectbox("园区（必填）", options=[""] + parks)
+            园区 = st.selectbox("园区*", options=[""] + parks)
         with c2:
-            所属区域 = st.text_input("所属区域（选填）")
+            区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+            所属区域 = st.selectbox("所属区域（选填）", options=[""] + 区域_opts)
         with c3:
-            城市 = st.text_input("所在城市（选填）")
+            城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+            城市 = st.selectbox("所在城市（选填）", options=[""] + 城市_opts)
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            所属业态 = st.text_input("所属业态（必填，例如：独立 / 护理等）")
+            业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+            所属业态 = st.selectbox("所属业态*", options=[""] + 业态_opts)
         with c5:
-            项目分级 = st.text_input("项目分级（必填，例如：一级/二级/三级）")
+            分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+            项目分级 = st.selectbox("项目分级*", options=[""] + 分级_opts)
         with c6:
-            项目分类 = st.text_input("项目分类（必填，例如：品质提升 / 大修等）")
+            分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+            项目分类 = st.selectbox("项目分类*", options=[""] + 分类_opts)
 
         c7, c8 = st.columns(2)
         with c7:
-            拟定承建组织 = st.text_input("拟定承建组织（必填，例如：项目部 / 社区分包）")
+            承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+            拟定承建组织 = st.selectbox("拟定承建组织*", options=[""] + 承建_opts)
         with c8:
-            总部重点关注项目 = st.text_input("总部重点关注项目（选填）")
+            总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
+            总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts)
 
         c9, c10 = st.columns(2)
         with c9:
-            专业 = st.text_input("专业（必填，例如：土建设施 / 供配电等）")
+            专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+            专业 = st.selectbox("专业*", options=[""] + 专业_opts)
         with c10:
-            专业分包 = st.text_input("专业分包（选填，例如：土建-结构）")
+            分包_opts = _get_dropdown_options(df_all, "专业分包")
+            专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts)
 
-        项目名称 = st.text_input("项目名称（必填）")
+        项目名称 = st.text_input("项目名称*")
         备注说明 = st.text_area("备注说明（选填）")
         拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=0.0, step=1.0)
 
