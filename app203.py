@@ -5413,9 +5413,16 @@ def _render_project_wizard(df: pd.DataFrame):
 
 
 def _require_feishu_login() -> bool:
-    """登录门禁：当 FEISHU_LOGIN_REQUIRED=1 时，未登录用户需通过飞书 OAuth 登录后才能访问。"""
-    if str(os.getenv("FEISHU_LOGIN_REQUIRED", "0")).strip() != "1":
+    """登录门禁：当 FEISHU_LOGIN_REQUIRED=1 或 OAuth 配置完整且未显式关闭时，未登录用户需通过飞书 OAuth 登录后才能访问。"""
+    login_required = str(os.getenv("FEISHU_LOGIN_REQUIRED", "")).strip()
+    if login_required == "0":
         return True
+    if login_required != "1":
+        app_id = os.getenv("FEISHU_APP_ID")
+        secret = os.getenv("FEISHU_APP_SECRET")
+        redirect = os.getenv("FEISHU_REDIRECT_URI")
+        if not (app_id and secret and redirect):
+            return True
     if not FEISHU_OAUTH_AVAILABLE:
         st.warning("飞书登录模块未就绪，请确认 feishu_oauth.py 存在。")
         return True
@@ -5456,7 +5463,7 @@ def main():
 
     # 侧边栏：用户信息 + 数据源
     with st.sidebar:
-        if str(os.getenv("FEISHU_LOGIN_REQUIRED", "0")).strip() == "1" and st.session_state.get("feishu_user"):
+        if st.session_state.get("feishu_user"):
             u = st.session_state["feishu_user"]
             name = u.get("name") or u.get("user_id") or u.get("open_id", "未知")
             st.caption(f"👤 {name}")
