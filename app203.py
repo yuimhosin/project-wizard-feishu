@@ -5418,14 +5418,8 @@ def main():
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
 
-    render_审核流程说明()
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["项目统计分析", "地图与统计", "全部项目（可在线编辑）", "新增/修改项目", "AI 助手"])
+    tab1, tab2 = st.tabs(["全部项目（可在线编辑）", "新增/修改项目"])
     with tab1:
-        render_项目统计分析(df, 园区选择)
-    with tab2:
-        render_地图与统计(df, 园区选择)
-    with tab3:
         st.subheader("全部项目清单（可在线编辑）")
         st.caption(f"共 {len(df)} 条项目。可在下表中直接增删改，点击下方按钮保存到数据库。")
         base_order = [
@@ -5456,65 +5450,12 @@ def main():
                     st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
             else:
                 st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
-    with tab4:
+    with tab2:
         st.subheader("项目录入 / 修改向导")
         st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
         if _get_feishu_webhook_url():
             st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
         _render_project_wizard(df)
-    with tab5:
-        st.subheader("AI 助手（DeepSeek 驱动）")
-        st.markdown(
-            """
-            这个 AI 窗口用于：**使用说明**、**查询与筛选建议**（如“帮我查找三月立项的项目”）。  
-            需在 `.streamlit/secrets.toml` 或环境变量中配置 `DEEPSEEK_API_KEY` 后即可对话。
-            """
-        )
-        api_key = _get_deepseek_api_key()
-
-        if "ai_messages" not in st.session_state:
-            st.session_state["ai_messages"] = [
-                {
-                    "role": "assistant",
-                    "content": "你好，我是本看板的 AI 助手，可以回答使用问题，也可以帮你构思如何在当前页面筛选数据。",
-                }
-            ]
-
-        # 展示历史对话
-        for msg in st.session_state["ai_messages"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        # 接收新问题
-        question = st.chat_input("请输入你的问题，例如：如何上传数据？或：帮我查找三月立项的项目。")
-        if question:
-            st.session_state["ai_messages"].append({"role": "user", "content": question})
-            # 先处理简单的本地数据查询示例：三月立项的项目
-            found_df = None
-            if "三月" in question and ("立项" in question or "需求立项" in question):
-                if "需求立项" in df.columns:
-                    dt = pd.to_datetime(df["需求立项"], errors="coerce", format="mixed")
-                    mask = dt.notna() & (dt.dt.month == 3)
-                    found_df = df.loc[mask].copy()
-
-            with st.chat_message("assistant"):
-                answer = _answer_with_deepseek(api_key, question, df)
-                st.markdown(answer)
-                # 如果有三月立项示例查询结果，则在 AI 回复下方补充一个表格
-                if found_df is not None:
-                    if found_df.empty:
-                        st.info("在当前数据中，未找到 3 月份立项的项目（需求立项日期在 3 月）。")
-                    else:
-                        st.markdown(f"**额外查询结果：共找到 {len(found_df)} 条 3 月份立项的项目（仅展示前 50 条）：**")
-                        show_cols = [c for c in ["园区", "项目名称", "项目分级", "专业", "拟定金额", "需求立项"] if c in found_df.columns]
-                        if not show_cols:
-                            show_cols = found_df.columns.tolist()
-                        st.dataframe(
-                            found_df[show_cols].head(50),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                st.session_state["ai_messages"].append({"role": "assistant", "content": answer})
 
 
 if __name__ == "__main__":
