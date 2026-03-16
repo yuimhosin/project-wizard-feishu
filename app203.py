@@ -54,11 +54,11 @@ st.set_page_config(
 )
 
 # 默认数据目录与默认单文件路径
-# 这里将项目根目录下的 CSV 表作为默认文件，方便打包后的 exe 直接使用
-DEFAULT_DATA_DIR = str(Path(__file__).resolve().parent)
-DEFAULT_SINGLE_FILE = str(
-    Path(__file__).resolve().parent / "改良改造报表-V4.csv"
-)
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = str(ROOT_DIR)
+DEFAULT_SINGLE_FILE = str(ROOT_DIR / "改良改造报表-V4.csv")
+# 内嵌默认数据（加密 .enc，随 git 提交，Streamlit Cloud 部署用）
+DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
 专业大类 = [
@@ -91,6 +91,24 @@ def save_to_db(df: pd.DataFrame):
         return
     with _get_db_connection() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
+
+
+def _ensure_default_data_seeded():
+    """
+    应用启动时：若数据库为空且存在内嵌 .enc 文件，则自动加载并写入数据库，
+    使 改良改造报表-V4-sample.csv.enc 成为默认显示数据。
+    """
+    if not load_from_db().empty:
+        return
+    default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
+    if not default_csv.exists():
+        return
+    try:
+        df = load_single_csv(str(default_csv))
+        if not df.empty:
+            save_to_db(df)
+    except Exception:
+        pass
 
 
 def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -5054,46 +5072,71 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown("---")
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
 
+        def _edit_opts(col):
+            vals = df_all[col].dropna().astype(str).str.strip().tolist()
+            return sorted(set(v for v in vals if v and v not in ("nan", "")))
+
+        园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+        业态_opts_e = _edit_opts("所属业态") if "所属业态" in df_all.columns else []
+        分级_opts_e = _edit_opts("项目分级") if "项目分级" in df_all.columns else ["一级", "二级", "三级"]
+        分类_opts_e = _edit_opts("项目分类") if "项目分类" in df_all.columns else ["品质提升", "大修", "应急抢修"]
+        承建_opts_e = _edit_opts("拟定承建组织") if "拟定承建组织" in df_all.columns else ["不动产项目部", "社区分包"]
+        专业_opts_e = sorted(set(_edit_opts("专业")) | set(专业大类)) if "专业" in df_all.columns else 专业大类
+        分包_opts_e = _edit_opts("专业分包") if "专业分包" in df_all.columns else []
+        关注_opts_e = _edit_opts("总部重点关注项目") if "总部重点关注项目" in df_all.columns else []
+
+        def _opts_with_current(opts, val):
+            v = str(val or "").strip()
+            if v and v not in opts:
+                return [v] + sorted(opts)
+            return opts
+
+        def _idx(opts, val):
+            v = str(val or "").strip()
+            opts_final = _opts_with_current(opts, val)
+            if v in opts_final:
+                return opts_final.index(v) + 1
+            return 0
+
+        def _sel(label, opts, val, key):
+            opts_f = _opts_with_current(opts, val)
+            return st.selectbox(label, options=[""] + opts_f, index=_idx(opts_f, val), key=key)
+
         with st.form("edit_project_form"):
             st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次修改的内容（含字段变更详情）将推送到飞书。")
             st.markdown("**基础信息**")
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.text_input("序号（自动）", value=str(int(target_row["序号"])), disabled=True)
-                园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
                 园区默认 = str(target_row.get("园区", ""))
-                园区 = st.selectbox(
-                    "园区（选填）",
-                    options=[""] + 园区_options,
-                    index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
-                )
+                园区_opts = _opts_with_current(园区_options, 园区默认)
+                园区 = st.selectbox("园区（选填）", options=[""] + 园区_opts, index=_idx(园区_opts, 园区默认))
             with c2:
                 所属区域 = st.text_input("所属区域（选填）", value=str(target_row.get("所属区域", "")))
                 城市 = st.text_input("所在城市（选填）", value=str(target_row.get("城市", "")))
             with c3:
-                所属业态 = st.text_input("所属业态（选填）", value=str(target_row.get("所属业态", "")))
-
+                所属业态 = _sel("所属业态（选填）", 业态_opts_e, target_row.get("所属业态"), "edit_业态")
             st.markdown("**项目属性**")
             c4, c5, c6 = st.columns(3)
             with c4:
-                项目分级 = st.text_input("项目分级（选填）", value=str(target_row.get("项目分级", "")))
+                项目分级 = _sel("项目分级（选填）", 分级_opts_e, target_row.get("项目分级"), "edit_分级")
             with c5:
-                项目分类 = st.text_input("项目分类（选填）", value=str(target_row.get("项目分类", "")))
+                项目分类 = _sel("项目分类（选填）", 分类_opts_e, target_row.get("项目分类"), "edit_分类")
             with c6:
-                拟定承建组织 = st.text_input("拟定承建组织（选填）", value=str(target_row.get("拟定承建组织", "")))
+                拟定承建组织 = _sel("拟定承建组织（选填）", 承建_opts_e, target_row.get("拟定承建组织"), "edit_承建")
 
             c7, c8 = st.columns(2)
             with c7:
-                总部重点关注项目 = st.text_input("总部重点关注项目（选填）", value=str(target_row.get("总部重点关注项目", "")))
+                总部重点关注项目 = _sel("总部重点关注项目（选填）", 关注_opts_e, target_row.get("总部重点关注项目"), "edit_关注")
             with c8:
                 拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
 
             st.markdown("**专业与名称**")
             c9, c10 = st.columns(2)
             with c9:
-                专业 = st.text_input("专业（选填）", value=str(target_row.get("专业", "")))
+                专业 = _sel("专业（选填）", 专业_opts_e, target_row.get("专业"), "edit_专业")
             with c10:
-                专业分包 = st.text_input("专业分包（选填）", value=str(target_row.get("专业分包", "")))
+                专业分包 = _sel("专业分包（选填）", 分包_opts_e, target_row.get("专业分包"), "edit_分包")
             项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
             备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
 
@@ -5178,13 +5221,27 @@ def _render_project_wizard(df: pd.DataFrame):
     next_seq = _get_next_序号(df_all)
     required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称"]
 
+    # 从现有数据提取下拉选项，减少手动输入
+    def _opts(col):
+        vals = df_all[col].dropna().astype(str).str.strip().tolist()
+        return sorted(set(v for v in vals if v and v not in ("nan", "")))
+
+    parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+    业态_opts = _opts("所属业态") if "所属业态" in df_all.columns else []
+    分级_opts = _opts("项目分级") if "项目分级" in df_all.columns else ["一级", "二级", "三级"]
+    分类_opts = _opts("项目分类") if "项目分类" in df_all.columns else ["品质提升", "大修", "应急抢修"]
+    承建_opts = _opts("拟定承建组织") if "拟定承建组织" in df_all.columns else ["不动产项目部", "社区分包"]
+    专业_opts = sorted(set(_opts("专业")) | set(专业大类)) if "专业" in df_all.columns else 专业大类
+    分包_opts = _opts("专业分包") if "专业分包" in df_all.columns else []
+    关注_opts = _opts("总部重点关注项目") if "总部重点关注项目" in df_all.columns else []
+
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
         st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次录入的内容（含字段信息）将推送到飞书。")
+        st.caption("💡 下拉选项来自已有数据，可快速选择；若需新增选项，在「或输入新值」中填写。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
             园区 = st.selectbox("园区（必填）", options=[""] + parks)
         with c2:
             所属区域 = st.text_input("所属区域（选填）")
@@ -5193,23 +5250,43 @@ def _render_project_wizard(df: pd.DataFrame):
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            所属业态 = st.text_input("所属业态（必填，例如：独立 / 护理等）")
+            所属业态 = st.selectbox("所属业态（必填）", options=[""] + 业态_opts, key="add_业态")
         with c5:
-            项目分级 = st.text_input("项目分级（必填，例如：一级/二级/三级）")
+            项目分级 = st.selectbox("项目分级（必填）", options=[""] + 分级_opts, key="add_分级")
         with c6:
-            项目分类 = st.text_input("项目分类（必填，例如：品质提升 / 大修等）")
+            项目分类 = st.selectbox("项目分类（必填）", options=[""] + 分类_opts, key="add_分类")
 
         c7, c8 = st.columns(2)
         with c7:
-            拟定承建组织 = st.text_input("拟定承建组织（必填，例如：项目部 / 社区分包）")
+            拟定承建组织 = st.selectbox("拟定承建组织（必填）", options=[""] + 承建_opts, key="add_承建")
         with c8:
-            总部重点关注项目 = st.text_input("总部重点关注项目（选填）")
+            总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 关注_opts, key="add_关注")
 
         c9, c10 = st.columns(2)
         with c9:
-            专业 = st.text_input("专业（必填，例如：土建设施 / 供配电等）")
+            专业 = st.selectbox("专业（必填）", options=[""] + 专业_opts, key="add_专业")
         with c10:
-            专业分包 = st.text_input("专业分包（选填，例如：土建-结构）")
+            专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts, key="add_分包")
+
+        with st.expander("若选项不在列表中，可在此输入新值（留空则使用上方选择）"):
+            c_other1, c_other2 = st.columns(2)
+            with c_other1:
+                所属业态_新 = st.text_input("所属业态", key="add_业态_新", placeholder="留空则用上选")
+                项目分级_新 = st.text_input("项目分级", key="add_分级_新", placeholder="留空则用上选")
+                项目分类_新 = st.text_input("项目分类", key="add_分类_新", placeholder="留空则用上选")
+            with c_other2:
+                拟定承建组织_新 = st.text_input("拟定承建组织", key="add_承建_新", placeholder="留空则用上选")
+                专业_新 = st.text_input("专业", key="add_专业_新", placeholder="留空则用上选")
+            if 所属业态_新.strip():
+                所属业态 = 所属业态_新.strip()
+            if 项目分级_新.strip():
+                项目分级 = 项目分级_新.strip()
+            if 项目分类_新.strip():
+                项目分类 = 项目分类_新.strip()
+            if 拟定承建组织_新.strip():
+                拟定承建组织 = 拟定承建组织_新.strip()
+            if 专业_新.strip():
+                专业 = 专业_新.strip()
 
         项目名称 = st.text_input("项目名称（必填）")
         备注说明 = st.text_area("备注说明（选填）")
@@ -5267,6 +5344,9 @@ def _render_project_wizard(df: pd.DataFrame):
 
 
 def main():
+    # 启动时自动用内嵌 .enc 初始化数据库（若为空），确保默认显示数据
+    _ensure_default_data_seeded()
+
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
 
@@ -5283,20 +5363,21 @@ def main():
 
         if source == "数据库（团队共享）":
             if df_db.empty:
-                # 若默认 CSV（改良改造报表-V4.csv）存在，则用其初始化团队共享数据库
-                default_csv = Path(DEFAULT_SINGLE_FILE)
+                # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
+                default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
                 if default_csv.exists():
                     try:
                         df = load_single_csv(str(default_csv))
                         if not df.empty:
                             save_to_db(df)
+                            fname = default_csv.name
                             if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已用「改良改造报表-V4.csv」初始化，共 {len(df)} 条记录。"):
-                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
+                                if push_to_feishu(f"【养老社区进度表】已用「{fname}」初始化，共 {len(df)} 条记录。"):
+                                    st.success(f"已用「{fname}」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
                                 else:
-                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                                    st.success(f"已用「{fname}」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
                             else:
-                                st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
+                                st.success(f"已用「{fname}」初始化团队共享数据库，共 {len(df)} 条记录。")
                         else:
                             st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
                     except Exception as e:
