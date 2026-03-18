@@ -35,8 +35,8 @@ def _rag_search(query: str) -> str:
 def _stats_analysis(question: str) -> str:
     """统计分析：直接从多维表格拉取全量数据做聚合统计。适用于：机构排名、上报数量、按时间/分类统计。"""
     from stats_analysis import get_records, format_stats_report
-    recs = get_records()
-    return format_stats_report(recs, question)
+    recs, from_cache = get_records()
+    return format_stats_report(recs, question, from_cache=from_cache)
 
 
 def _get_current_time(timezone: str = "Asia/Shanghai") -> str:
@@ -69,9 +69,26 @@ def _get_current_time(timezone: str = "Asia/Shanghai") -> str:
         return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _list_tables() -> str:
+    """返回已配置的文档/表格清单（名称 + 链接），用于统一入口管理。"""
+    from feishu_doc_sync import get_doc_list_with_urls
+    items = get_doc_list_with_urls()
+    if not items:
+        return "当前未配置任何文档或表格。请在 FEISHU_DOC_IDS 中添加飞书文档/多维表格链接。"
+    lines = []
+    for i, (title, url) in enumerate(items, 1):
+        lines.append(f"{i}. **{title}**\n   {url}")
+    return "\n\n".join(lines)
+
+
 def _create_tools():
     """创建 Agent 可调用的工具"""
     from langchain_core.tools import tool
+
+    @tool
+    def list_tables() -> str:
+        """表格清单：列出所有已配置的飞书文档/多维表格及链接。用于：有哪些表格、表格入口、管理所有表、查看数据源等。"""
+        return _list_tables()
 
     @tool
     def rag_search(query: str) -> str:
@@ -88,7 +105,7 @@ def _create_tools():
         """联网获取当前时间。用于：现在几点了、今天日期、当前时间等。timezone 如 Asia/Shanghai（中国）、America/New_York 等。"""
         return _get_current_time(timezone)
 
-    return [rag_search, stats_analysis, get_current_time]
+    return [list_tables, rag_search, stats_analysis, get_current_time]
 
 
 def _get_llm():
@@ -116,12 +133,13 @@ def _build_agent():
     tool_node = ToolNode(tools)
 
     SYSTEM = """你是企业知识库助手。根据用户问题选择工具：
+- 有哪些表格/表格入口/管理所有表/数据源列表 → 用 list_tables
 - 现在几点/今天日期/当前时间 → 用 get_current_time
 - 统计/机构排名/上报数量/哪个最积极/按月份 → 用 stats_analysis
 - 电梯/漏水/渗漏/特种设备/困人/故障/管道/消防/人身安全 等具体事件 → 用 stats_analysis
 - 其他查询 → 用 rag_search
 
-回答要求：当 stats_analysis 返回事件详情时，请先做简要分析（机构分布、事件类型、时间趋势等），再列出关键记录，不要只罗列数据。"""
+回答要求：当 stats_analysis 返回事件详情时，请先做简要分析（机构分布、事件类型、时间趋势等），再列出关键记录，不要只罗列数据。list_tables 返回的链接请原样展示，方便用户点击。"""
 
     def agent(state):
         msgs = [SystemMessage(content=SYSTEM)] + list(state["messages"])
@@ -151,10 +169,13 @@ def _fast_path(question: str):
     快捷路径：问题明确匹配某工具时直接调用，省 1 次 LLM 往返（约 1–3 秒）。
     """
     q = question.strip()
+    # 表格清单：统一入口
+    if any(kw in q for kw in ("有哪些表格", "表格入口", "管理所有表", "数据源列表", "有哪些文档", "有哪些数据")):
+        return _list_tables()
     # 时间类：直接返回，无需 LLM
     if any(kw in q for kw in ("现在几点", "今天日期", "当前时间", "今天几号", "现在什么时候")):
         return _get_current_time()
-    # 仅纯统计类走快捷路径（直接返回数字）；具体事件查询（电梯/漏水等）走 Agent，由 LLM 做分析总结
+    # 统计类走快捷路径
     if any(kw in q for kw in ("统计", "哪个机构", "上报最积极", "机构排名", "上报数量", "按月份")):
         return _stats_analysis(question)
     return None

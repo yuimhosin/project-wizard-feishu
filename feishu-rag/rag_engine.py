@@ -87,19 +87,26 @@ class RAGEngine:
             json.dump(contents, f, ensure_ascii=False, indent=2)
 
     def _rebuild_db(self, contents: dict):
-        """Rebuild FAISS from all stored contents"""
+        """Rebuild FAISS from all stored contents. 优先使用分割好的 chunks，否则对 content 自动分块。"""
         from langchain_core.documents import Document
         from langchain_community.vectorstores import FAISS
 
         all_docs = []
         for doc_id, data in contents.items():
-            content = data.get("content", "")
             title = data.get("title", "")
-            if not content.strip():
-                continue
-            chunks = _chunk_text(content)
-            for c in chunks:
-                all_docs.append(Document(page_content=c, metadata={"doc_id": doc_id, "title": title}))
+            chunks = data.get("chunks")
+            if chunks and isinstance(chunks, list):
+                # 分割好的数据：直接使用每个 chunk
+                for c in chunks:
+                    if c and str(c).strip():
+                        all_docs.append(Document(page_content=str(c).strip(), metadata={"doc_id": doc_id, "title": title}))
+            else:
+                # 未分割：对 content 自动分块
+                content = data.get("content", "")
+                if not content or not str(content).strip():
+                    continue
+                for c in _chunk_text(str(content)):
+                    all_docs.append(Document(page_content=c, metadata={"doc_id": doc_id, "title": title}))
 
         if not all_docs:
             all_docs = [Document(page_content=" ", metadata={"doc_id": "__empty__", "title": ""})]
@@ -139,10 +146,13 @@ class RAGEngine:
                 self._save_db()
         return self._db
 
-    def add_document(self, doc_id: str, content: str, title: str = ""):
-        """Store doc and rebuild index"""
+    def add_document(self, doc_id: str, content: str = None, title: str = "", chunks: list = None):
+        """Store doc and rebuild index. 若提供 chunks（分割好的数据）则优先使用，否则对 content 自动分块。"""
         contents = self._load_contents()
-        contents[doc_id] = {"content": content, "title": title}
+        if chunks and isinstance(chunks, list):
+            contents[doc_id] = {"chunks": [str(c).strip() for c in chunks if c and str(c).strip()], "title": title}
+        else:
+            contents[doc_id] = {"content": content or "", "title": title}
         self._save_contents(contents)
         self._rebuild_db(contents)
         self._save_db()
@@ -190,8 +200,8 @@ class RAGEngine:
         )):
             try:
                 from stats_analysis import get_records, format_stats_report
-                recs = get_records()
-                return format_stats_report(recs, q)
+                recs, from_cache = get_records()
+                return format_stats_report(recs, q, from_cache=from_cache)
             except Exception as e:
                 return f"统计分析失败：{e}"
 

@@ -8,6 +8,9 @@ FEISHU_DOC_IDS=https://xxx.feishu.cn/wiki/xxx
 # 文档分享授权码（可选）：保密文档/仅链接可访问时，填写分享时获得的 pt-xxx 授权码
 # FEISHU_PERMISSION_TOKEN=pt-xxx
 
+# 事件订阅加密：飞书控制台若启用了 Encrypt Key，必须在此填写相同值，否则 challenge 无法返回
+# FEISHU_ENCRYPT_KEY=
+
 # DeepSeek for LLM (required)
 DEEPSEEK_API_KEY=sk-xxx
 # DEEPSEEK_MODEL=deepseek-chat
@@ -18,4 +21,5 @@ DEEPSEEK_API_KEY=sk-xxx
 # FEISHU_RAG_TOP_K_LIST=50
 
 # Agentic RAG：Agent 自动选择 RAG 检索或统计分析（需 langgraph）
+# 支持「有哪些表格」「表格入口」等统一管理入口
 # FEISHU_AGENTIC_RAG=1

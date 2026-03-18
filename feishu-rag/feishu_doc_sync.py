@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from config import FEISHU_DOC_IDS, VECTOR_DB_PATH, SYNC_INTERVAL
+from config import FEISHU_DOC_IDS, FEISHU_DOC_URLS, VECTOR_DB_PATH, SYNC_INTERVAL
 from feishu_api_client import get_doc_raw_content, get_doc_info, list_wiki_space_docs, get_bitable_raw_content
 
 
@@ -131,6 +131,41 @@ def sync_documents(on_update: Optional[Callable[[str, str, str], None]] = None) 
 
     _save_meta(meta)
     return stats
+
+
+def get_doc_list_with_urls() -> list:
+    """
+    返回 [(title, url), ...]，用于「表格清单」等统一入口。
+    从 doc_meta 取标题，从 FEISHU_DOC_URLS 取链接。
+    """
+    meta = _load_meta()
+    result = []
+    for i, item in enumerate(FEISHU_DOC_IDS):
+        if not item or len(item) != 2:
+            continue
+        source, doc_id = item
+        url = FEISHU_DOC_URLS[i] if i < len(FEISHU_DOC_URLS) else ""
+        title = ""
+        if source == "bitable":
+            app_token, table_id = doc_id if isinstance(doc_id, tuple) else ("", "")
+            meta_key = f"bitable:{app_token}:{table_id}"
+            title = (meta.get(meta_key) or {}).get("title", f"多维表格_{(table_id or app_token)[:12]}")
+        elif source == "wiki":
+            meta_key = f"wiki:{doc_id}"
+            if meta_key in meta:
+                title = meta[meta_key].get("title", "知识库")
+            else:
+                for k, v in meta.items():
+                    if k.startswith(f"wiki:{doc_id}:"):
+                        title = v.get("title", "知识库")
+                        break
+                if not title:
+                    title = "知识库"
+        else:
+            meta_key = f"{source}:{doc_id}"
+            title = (meta.get(meta_key) or {}).get("title", "文档")
+        result.append((title, url))
+    return result
 
 
 def run_sync_loop(on_update: Optional[Callable[[str, str, str], None]] = None, interval: int = None):

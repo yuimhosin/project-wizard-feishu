@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 多维表格统计分析：按机构、时间等维度统计
+优先从 bitable API 拉取；若 API 失败则从已同步的 doc_contents 解析
 """
 import sys
+import json
+import re
 from pathlib import Path
 from collections import Counter
 from datetime import datetime
@@ -11,7 +14,7 @@ _root = Path(__file__).resolve().parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from config import FEISHU_DOC_IDS
+from config import FEISHU_DOC_IDS, VECTOR_DB_PATH
 from feishu_api_client import get_bitable_records
 
 
@@ -59,8 +62,55 @@ def _format_record_value(k: str, v) -> str:
     return s
 
 
-def get_records() -> list[dict]:
-    """从配置的 bitable 获取所有记录"""
+def _parse_records_from_content(content: str) -> list[dict]:
+    """从 doc_contents 的 content 文本解析出记录（格式：上报时间: xxx\n上报机构: xxx\n...）"""
+    if not content or not content.strip():
+        return []
+    records = []
+    # 按「上报时间:」分割，每条记录以 上报时间 开头
+    parts = re.split(r"\n(?=上报时间:)", content.strip())
+    for part in parts:
+        part = part.strip()
+        if not part or not part.startswith("上报时间:"):
+            continue
+        rec = {}
+        for line in part.split("\n"):
+            if ":" in line:
+                k, _, v = line.partition(":")
+                k, v = k.strip(), v.strip()
+                if k and k not in ("file_token", "tmp_url", "avatar_url"):
+                    rec[k] = v
+        if rec:
+            records.append(rec)
+    return records
+
+
+def _get_records_from_doc_contents() -> list[dict]:
+    """从已同步的 doc_contents.json 解析 bitable 内容（API 失败时的 fallback）"""
+    contents_file = Path(VECTOR_DB_PATH) / "doc_contents.json"
+    if not contents_file.exists():
+        return []
+    try:
+        with open(contents_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    records = []
+    for doc_id, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        if not doc_id.startswith("bitable:"):
+            continue
+        content = item.get("content", "")
+        records.extend(_parse_records_from_content(content))
+    return records
+
+
+def get_records() -> tuple[list[dict], bool]:
+    """
+    从配置的 bitable 获取所有记录；API 失败时从 doc_contents 解析。
+    返回 (records, from_cache)：from_cache=True 表示使用本地缓存。
+    """
     records = []
     for item in FEISHU_DOC_IDS:
         if not item or len(item) != 2:
@@ -69,7 +119,11 @@ def get_records() -> list[dict]:
         if source == "bitable":
             app_token, table_id = doc_id if isinstance(doc_id, tuple) else ("", "")
             records.extend(get_bitable_records(app_token, table_id))
-    return records
+    from_cache = False
+    if not records:
+        records = _get_records_from_doc_contents()
+        from_cache = bool(records)
+    return records, from_cache
 
 
 def stats_by_org(records: list[dict], org_field: str = "上报机构") -> list[tuple]:
@@ -133,7 +187,7 @@ def format_event_details(records: list[dict], limit: int = 20) -> str:
     return "\n\n".join(lines)
 
 
-def format_stats_report(records: list[dict], question: str = "") -> str:
+def format_stats_report(records: list[dict], question: str = "", from_cache: bool = False) -> str:
     """
     根据问题生成统计报告。
     支持：机构上报、上报积极、统计、分析 等关键词
@@ -143,6 +197,7 @@ def format_stats_report(records: list[dict], question: str = "") -> str:
         return "暂无数据，请确认多维表格已配置且可访问。"
 
     q = (question or "").strip()
+    cache_note = "\n（注：飞书 API 暂不可用，以上为本地已同步数据的统计）\n" if from_cache else ""
     q_lower = q.lower()
 
     # 具体事件关键词：优先返回匹配的事件详情，而非仅统计
@@ -153,14 +208,14 @@ def format_stats_report(records: list[dict], question: str = "") -> str:
         if filtered:
             lines = [f"共找到 {len(filtered)} 条与「{'/'.join(matched_kw)}」相关的事件：\n"]
             lines.append(format_event_details(filtered, limit=15))
-            return "\n".join(lines)
+            return "\n".join(lines) + cache_note
         else:
             lines = [f"共 {len(records)} 条记录，但未找到与「{'/'.join(matched_kw)}」直接相关的事件。\n"]
             lines.append("可能原因：事件描述使用了其他术语，或归类在其他分类下。")
             lines.append("\n【按事件分类统计】（可参考「异常事件-基础设施」「人身安全」等）")
             for t, n in stats_by_event_type(records)[:8]:
                 lines.append(f"  {t}: {n} 条")
-            return "\n".join(lines)
+            return "\n".join(lines) + cache_note
 
     lines = [f"共 {len(records)} 条记录。\n"]
 
@@ -194,9 +249,9 @@ def format_stats_report(records: list[dict], question: str = "") -> str:
         if by_org:
             lines.append(f"\n上报最积极: {by_org[0][0]} ({by_org[0][1]} 条)")
 
-    return "\n".join(lines)
+    return "\n".join(lines) + cache_note
 
 
 if __name__ == "__main__":
-    recs = get_records()
-    print(format_stats_report(recs, "哪个机构上报最积极"))
+    recs, from_cache = get_records()
+    print(format_stats_report(recs, "哪个机构上报最积极", from_cache=from_cache))

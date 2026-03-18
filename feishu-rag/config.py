@@ -53,20 +53,25 @@ FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_PERMISSION_TOKEN = os.getenv("FEISHU_PERMISSION_TOKEN", "")
 
 # 文档 ID 列表（逗号分隔，支持 doc_token、document_id、wiki、bitable 链接）
-def _parse_doc_ids(raw: str) -> list:
+def _parse_doc_ids(raw: str) -> tuple:
+    """返回 (ids, urls)：ids 为 [(source, doc_id), ...]，urls 为 [原始链接, ...]"""
     import re
     ids = []
+    urls = []
     for x in raw.split(","):
         x = x.strip()
         if not x:
             continue
+        url = x if x.startswith("http") else ""
         # wiki 链接
         if "wiki/" in x or "feishu.cn/wiki" in x:
             m = re.search(r"wiki/([A-Za-z0-9]+)", x)
             if m:
                 ids.append(("wiki", m.group(1)))
+                urls.append(url or f"https://feishu.cn/wiki/{m.group(1)}")
             else:
                 ids.append(("doc", x))
+                urls.append(url or x)
         # 多维表格 base/ 链接
         elif "base/" in x or "feishu.cn/base" in x:
             m = re.search(r"base/([A-Za-z0-9]+)", x)
@@ -75,13 +80,24 @@ def _parse_doc_ids(raw: str) -> list:
                 app_token = m.group(1)
                 table_id = table_m.group(1) if table_m else ""
                 ids.append(("bitable", (app_token, table_id)))
+                if url:
+                    urls.append(url)
+                else:
+                    u = f"https://feishu.cn/base/{app_token}"
+                    if table_id:
+                        u += f"?table={table_id}"
+                    urls.append(u)
             else:
                 ids.append(("doc", x))
+                urls.append(url or x)
         else:
             ids.append(("doc", x))
-    return ids
+            urls.append(url or f"https://feishu.cn/docx/{x}" if re.match(r"^[A-Za-z0-9]+$", x) else x)
+    return ids, urls
 
-FEISHU_DOC_IDS = _parse_doc_ids(os.getenv("FEISHU_DOC_IDS", ""))
+_parsed = _parse_doc_ids(os.getenv("FEISHU_DOC_IDS", ""))
+FEISHU_DOC_IDS = _parsed[0]
+FEISHU_DOC_URLS = _parsed[1]  # 与 FEISHU_DOC_IDS 一一对应的可访问链接
 
 # 向量库路径
 FEISHU_RAG_ROOT = Path(__file__).resolve().parent

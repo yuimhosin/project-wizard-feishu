@@ -1,6 +1,7 @@
 # 环境与密钥
 .env
 .streamlit/secrets.toml
+feishu-rag/.streamlit/secrets.toml
 *.env
 !env_example.txt
 !*.env.example

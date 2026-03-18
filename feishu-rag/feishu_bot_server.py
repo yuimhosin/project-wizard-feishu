@@ -125,7 +125,7 @@ class FeishuEventHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         raw = json.loads(body.decode("utf-8")) if body else {}
-        print(f"[FEISHU] POST /feishu/event body_len={len(body)} type={raw.get('type')} event_type={raw.get('header',{}).get('event_type')}", flush=True)
+        print(f"[FEISHU] POST /feishu/event body_len={len(body)} keys={list(raw.keys())} type={raw.get('type')}", flush=True)
 
         # 1. 校验（若配置了）
         if FEISHU_VERIFY_TOKEN and raw.get("token") != FEISHU_VERIFY_TOKEN:
@@ -135,14 +135,22 @@ class FeishuEventHandler(BaseHTTPRequestHandler):
 
         # 2. 解密（若加密）
         if raw.get("encrypt"):
-            raw = _decrypt_event(raw["encrypt"])
+            if not FEISHU_ENCRYPT_KEY:
+                print("[FEISHU] 收到加密请求，但未配置 FEISHU_ENCRYPT_KEY。请在飞书开放平台复制「Encrypt Key」到 .env", flush=True)
+            decrypted = _decrypt_event(raw["encrypt"])
+            if decrypted:
+                raw = decrypted
+            else:
+                print("[FEISHU] 解密失败，请检查 FEISHU_ENCRYPT_KEY 是否与飞书控制台一致", flush=True)
 
         # 3. 立即返回 200，url_verification 必须返回 challenge
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         if raw.get("type") == "url_verification":
-            self.wfile.write(json.dumps({"challenge": raw.get("challenge", "")}).encode("utf-8"))
+            challenge = raw.get("challenge", "")
+            self.wfile.write(json.dumps({"challenge": challenge}).encode("utf-8"))
+            print(f"[FEISHU] url_verification 已返回 challenge (len={len(challenge)})", flush=True)
         else:
             self.wfile.write(b"{}")
 
@@ -151,7 +159,9 @@ class FeishuEventHandler(BaseHTTPRequestHandler):
             try:
                 typ = raw.get("type")
                 evt = raw.get("header", {}).get("event_type") or raw.get("event", {}).get("type")
-                print(f"[FEISHU] POST received type={typ} event_type={evt}")
+                print(f"[FEISHU] POST received type={typ} event_type={evt} keys={list(raw.keys())}", flush=True)
+                if typ != "url_verification" and evt and "im.message" not in str(evt):
+                    print(f"[FEISHU] 非消息事件，完整 header/event 前 500 字符: {str(raw)[:500]}", flush=True)
                 _handle_event(raw)
             except Exception as e:
                 import traceback
@@ -184,7 +194,12 @@ def _handle_event(raw: dict):
         return
 
     # 支持 schema 1.0/2.0，以及 v1/v2 事件
-    event_type = raw.get("header", {}).get("event_type") or raw.get("event", {}).get("type") or ""
+    event_type = (
+        raw.get("header", {}).get("event_type")
+        or raw.get("event", {}).get("type")
+        or raw.get("event", {}).get("event", {}).get("type")
+        or ""
+    )
 
     # 云文档变更：多维表格/文档编辑 -> 实时同步
     if "drive.file" in event_type:
