@@ -103,7 +103,7 @@ def _api_get(url: str, token: str) -> dict:
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = ""
@@ -308,7 +308,8 @@ def _pick_sheet_token(node: dict, parsed: dict) -> str:
 
 def _fetch_sheet_values(spreadsheet_token: str, sheet_title: str, token: str) -> list[list[Any]]:
     """优先用 values_batch_get；失败再尝试 values 接口。"""
-    rng = f"{sheet_title}!A1:AZ3000"
+    # 控制单次读取范围，避免超时；346 行数据场景足够覆盖
+    rng = f"{sheet_title}!A1:AZ1200"
     ranges = urllib.parse.quote(rng, safe="")
 
     # v2 batch_get
@@ -335,20 +336,42 @@ def _fetch_sheet_values(spreadsheet_token: str, sheet_title: str, token: str) ->
 
 
 def _sheet_rows_to_df(rows: list[list[Any]], sheet_name: str) -> pd.DataFrame:
-    if not rows or len(rows) < 2:
+    if not rows:
         return pd.DataFrame()
-    row0 = rows[0]
-    row1 = rows[1] if len(rows) >= 2 else []
-    names = _parse_header_from_rows(row0, row1, n_time=len(TIMELINE_COLS))
-    data_start = 2
-    # 兼容单行表头
-    if not _is_progress_sheet(names):
-        first_names = [str(x).strip() for x in row0]
+
+    names: list[str] = []
+    data_start = 0
+
+    # 先尝试首行/首两行（常见格式）
+    if len(rows) >= 2:
+        parsed = _parse_header_from_rows(rows[0], rows[1], n_time=len(TIMELINE_COLS))
+        if _is_progress_sheet(parsed):
+            names = parsed
+            data_start = 2
+    if not names:
+        first_names = [str(x).strip() for x in rows[0]]
         if _is_progress_sheet(first_names):
             names = first_names
             data_start = 1
-        else:
-            return pd.DataFrame()
+
+    # 再兜底：在前几行中搜索表头位置（适配上方有标题/空行的情况）
+    if not names:
+        probe_rows = min(len(rows), 8)
+        for i in range(probe_rows):
+            one = [str(x).strip() for x in rows[i]]
+            if _is_progress_sheet(one):
+                names = one
+                data_start = i + 1
+                break
+            if i + 1 < len(rows):
+                two = _parse_header_from_rows(rows[i], rows[i + 1], n_time=len(TIMELINE_COLS))
+                if _is_progress_sheet(two):
+                    names = two
+                    data_start = i + 2
+                    break
+    if not names:
+        return pd.DataFrame()
+
     data_rows = rows[data_start:]
     if not data_rows:
         return pd.DataFrame()
@@ -358,7 +381,12 @@ def _sheet_rows_to_df(rows: list[list[Any]], sheet_name: str) -> pd.DataFrame:
         rr = list(r[:width])
         if len(rr) < width:
             rr.extend([""] * (width - len(rr)))
+        # 跳过空白行
+        if not any(str(x).strip() for x in rr):
+            continue
         normalized_rows.append(rr)
+    if not normalized_rows:
+        return pd.DataFrame()
     df = pd.DataFrame(normalized_rows, columns=names)
     return _clean_to_project_schema(df, source_name=sheet_name)
 
@@ -371,6 +399,7 @@ def _load_from_sheet(spreadsheet_token: str, preferred_sheet_token: str, token: 
         return pd.DataFrame()
 
     sheets = data.get("data", {}).get("sheets", []) or []
+    all_sheets = list(sheets)
     if preferred_sheet_token:
         selected = [s for s in sheets if s.get("sheet_id") == preferred_sheet_token]
         sheets = selected or sheets
@@ -386,6 +415,19 @@ def _load_from_sheet(spreadsheet_token: str, preferred_sheet_token: str, token: 
             frames.append(df)
 
     if not frames:
+        # 若指定 sheet 无有效数据，自动回退扫描全工作簿
+        if preferred_sheet_token and len(sheets) < len(all_sheets):
+            for s in all_sheets:
+                title = s.get("title", "")
+                if not title:
+                    continue
+                rows = _fetch_sheet_values(spreadsheet_token, title, token)
+                df = _sheet_rows_to_df(rows, title)
+                if not df.empty:
+                    frames.append(df)
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        _set_last_error("已读取到电子表格，但未识别到可用数据表头（请确认包含“序号/项目分级/专业/拟定金额/项目名称”等列）。")
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 

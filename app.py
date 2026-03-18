@@ -36,6 +36,11 @@ except Exception:
     def get_feishu_doc_last_error() -> str:
         return ""
     FEISHU_DOC_AVAILABLE = False
+try:
+    from feishu_oauth import build_authorize_url, exchange_code_for_user
+    FEISHU_OAUTH_AVAILABLE = True
+except Exception:
+    FEISHU_OAUTH_AVAILABLE = False
 
 
 # ---------- 团队共享数据：SQLite 存储 ----------
@@ -54,15 +59,20 @@ def _get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
-def _has_feishu_app_credentials() -> bool:
-    """检查 FEISHU_APP_ID/FEISHU_APP_SECRET 是否已配置（环境变量或 secrets.toml）。"""
-    app_id = os.getenv("FEISHU_APP_ID", "").strip()
-    app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
-    if app_id and app_secret:
-        return True
-
+def _get_config_value(key: str, default: str = "") -> str:
+    """读取配置：环境变量 > st.secrets > 本地 secrets.toml。"""
+    v = os.getenv(key, "").strip()
+    if v:
+        return v
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            sv = str(st.secrets.get(key, "")).strip()
+            if sv:
+                return sv
+    except Exception:
+        pass
     if tomllib is None:
-        return False
+        return default
     candidate_files = [
         _Path.home() / ".streamlit" / "secrets.toml",
         _Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
@@ -72,12 +82,65 @@ def _has_feishu_app_credentials() -> bool:
             continue
         try:
             data = tomllib.loads(fp.read_text(encoding="utf-8"))
-            sid = str(data.get("FEISHU_APP_ID", "")).strip()
-            ssecret = str(data.get("FEISHU_APP_SECRET", "")).strip()
-            if sid and ssecret:
-                return True
+            vv = str(data.get(key, "")).strip()
+            if vv:
+                return vv
         except Exception:
             continue
+    return default
+
+
+def _has_feishu_app_credentials() -> bool:
+    """检查 FEISHU_APP_ID/FEISHU_APP_SECRET 是否已配置（环境变量或 secrets.toml）。"""
+    return bool(_get_config_value("FEISHU_APP_ID") and _get_config_value("FEISHU_APP_SECRET"))
+
+
+def _require_feishu_login() -> bool:
+    """登录门禁：开启后仅飞书员工可访问。"""
+    login_required = _get_config_value("FEISHU_LOGIN_REQUIRED", "")
+    if login_required == "0":
+        return True
+    if login_required != "1":
+        app_id = _get_config_value("FEISHU_APP_ID")
+        secret = _get_config_value("FEISHU_APP_SECRET")
+        redirect = _get_config_value("FEISHU_REDIRECT_URI")
+        if not (app_id and secret and redirect):
+            return True
+    if not FEISHU_OAUTH_AVAILABLE:
+        st.warning("飞书登录模块未就绪，请确认 feishu_oauth.py 存在。")
+        return True
+
+    app_id = _get_config_value("FEISHU_APP_ID")
+    secret = _get_config_value("FEISHU_APP_SECRET")
+    redirect = _get_config_value("FEISHU_REDIRECT_URI")
+    if not app_id or not secret or not redirect:
+        st.warning("请配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_REDIRECT_URI 以启用飞书登录。")
+        return True
+
+    # 兼容配置在 secrets.toml 的场景，供 feishu_oauth 模块读取
+    os.environ.setdefault("FEISHU_APP_ID", app_id)
+    os.environ.setdefault("FEISHU_APP_SECRET", secret)
+    os.environ.setdefault("FEISHU_REDIRECT_URI", redirect)
+
+    if st.session_state.get("feishu_user"):
+        return True
+
+    code = st.query_params.get("code")
+    if code:
+        try:
+            u = exchange_code_for_user(code)
+            if u:
+                st.session_state["feishu_user"] = u
+                st.query_params.clear()
+                st.rerun()
+        except Exception as e:
+            st.error(f"登录失败：{e}")
+            return False
+
+    auth_url = build_authorize_url(redirect, state="project-wizard")
+    st.markdown("### 请先登录")
+    st.markdown("仅泰康飞书员工可访问此项目。")
+    st.link_button("飞书登录", auth_url, type="primary")
     return False
 
 
@@ -292,60 +355,26 @@ def _render_project_wizard(df: pd.DataFrame):
     mode = st.radio("操作类型", ["新增项目", "修改已有项目"], horizontal=True)
 
     if mode == "修改已有项目":
-        st.markdown("### 步骤 1：查找要修改的项目")
-        # 1. 按园区筛选（优先）
-        园区列表 = sorted(df["园区"].dropna().astype(str).unique().tolist())
-        园区列表 = [p for p in 园区列表 if p and str(p).strip() and str(p) != "nan"]
-        园区选择 = st.multiselect(
-            "先选择园区（选择后自动显示该园区下项目）",
-            options=园区列表,
-            default=[],
-            key="wizard_search_园区",
-        )
-        candidates = df.copy()
-        if 园区选择:
-            candidates = candidates[candidates["园区"].astype(str).isin(园区选择)]
-            st.caption(f"已筛选园区：{', '.join(园区选择)}，共 {len(candidates)} 条")
-
-        # 2. 序号、项目名称进一步筛选
-        col1, col2 = st.columns(2)
-        with col1:
-            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
-        with col2:
-            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
-
-        if seq_input.strip():
-            try:
-                seq_val = int(float(seq_input.strip()))
-                candidates = candidates[pd.to_numeric(candidates["序号"], errors="coerce") == seq_val]
-            except ValueError:
-                candidates = candidates.iloc[0:0]
-        if name_kw.strip():
-            candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
-
-        if not 园区选择 and not seq_input.strip() and not name_kw.strip():
-            st.info("请至少选择园区、或输入序号、或输入项目名称关键词进行筛选。")
-            return
-
+        st.markdown("### 步骤 1：下拉选择要修改的数据")
+        candidates = df_all.reset_index(drop=True).copy()
+        candidates["_rid"] = candidates.index.astype(int)
         if candidates.empty:
-            st.info("未找到匹配项目，可切换到「新增项目」，或调整园区/序号/名称筛选条件。")
+            st.info("暂无可修改项目，请先新增或导入数据。")
             return
 
-        st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
-        display_cols = ["序号", "园区", "项目名称", "项目分级", "拟定金额"]
-        display_cols = [c for c in display_cols if c in candidates.columns]
-        disp_df = candidates[display_cols].head(50).copy()
-        if "拟定金额" in disp_df.columns:
-            disp_df = disp_df.rename(columns={"拟定金额": "预算金额"})
-        st.dataframe(disp_df, use_container_width=True, hide_index=True)
+        def _fmt_rid(rid: int) -> str:
+            row = candidates[candidates["_rid"] == rid].iloc[0]
+            seq = str(row.get("序号", "")).strip()
+            park = str(row.get("园区", "")).strip()
+            name = str(row.get("项目名称", "")).strip()
+            return f"序号{seq} | {park or '未标注园区'} | {name or '未命名项目'}"
 
-        seq_choices = sorted(candidates["序号"].dropna().astype(int).unique().tolist())
-        def _fmt(seq):
-            row = candidates[candidates["序号"].astype(int) == seq]
-            name = str(row["项目名称"].iloc[0])[:40] if len(row) and "项目名称" in row.columns else ""
-            return f"{seq} - {name}" if name else str(seq)
-        chosen_seq = st.selectbox("选择要修改的项目", options=seq_choices, format_func=_fmt)
-        target_row = df_all[df_all["序号"].astype(int) == int(chosen_seq)].iloc[0]
+        chosen_rid = st.selectbox(
+            "选择要修改的项目",
+            options=candidates["_rid"].tolist(),
+            format_func=_fmt_rid,
+        )
+        target_row = candidates[candidates["_rid"] == int(chosen_rid)].iloc[0]
 
         st.markdown("---")
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
@@ -600,10 +629,21 @@ def _render_project_wizard(df: pd.DataFrame):
 
 def main():
     st.set_page_config(page_title="养老社区项目向导", page_icon="🏠", layout="wide")
+
+    if not _require_feishu_login():
+        return
+
     st.title("养老社区改良改造 - 项目新增/修改向导")
     st.info("📤 支持项目录入、修改、删除，**保存时自动推送到飞书**")
 
     with st.sidebar:
+        if st.session_state.get("feishu_user"):
+            u = st.session_state["feishu_user"]
+            name = u.get("name") or u.get("user_id") or u.get("open_id", "未知")
+            st.caption(f"👤 {name}")
+            if st.button("退出登录", key="logout"):
+                del st.session_state["feishu_user"]
+                st.rerun()
         st.header("数据源")
         source = st.radio(
             "数据来源",
