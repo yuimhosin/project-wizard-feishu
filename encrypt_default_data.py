@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""将 改良改造报表-V4-sample.csv 加密为 .enc，供 git 提交。"""
+"""将默认数据 CSV 加密为 .enc，供仓库提交。"""
 from pathlib import Path
 
 from bundled_data_crypto import encrypt_file
 
 ROOT = Path(__file__).resolve().parent
-PLAIN = ROOT / "改良改造报表-V4-sample.csv"
-ENC = ROOT / "改良改造报表-V4-sample.csv.enc"
+PLAIN = ROOT / "改良改造报表-V4.csv"
+ENC = ROOT / "改良改造报表-V4.csv.enc"
+
 
 if __name__ == "__main__":
     if not PLAIN.exists():
-        print(f"未找到 {PLAIN}，跳过加密。")
-        exit(0)
+        print(f"未找到明文文件：{PLAIN}")
+        raise SystemExit(1)
     encrypt_file(PLAIN, ENC)
-    print(f"已加密: {PLAIN} -> {ENC}")
+    print(f"已加密：{PLAIN.name} -> {ENC.name}")

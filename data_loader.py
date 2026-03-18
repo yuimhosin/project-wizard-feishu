@@ -2,6 +2,7 @@
 """养老社区改良改造进度表 CSV/XLSX 解析与多园区数据加载。"""
 from pathlib import Path
 import pandas as pd
+import io
 
 # 表头第二行（时间节点列名）
 TIMELINE_COLS = [
@@ -278,6 +279,19 @@ def _load_flat_progress_csv(path: Path) -> pd.DataFrame:
     return _normalize_loaded_df(df, 园区名=None, default_园区_from=path.stem)
 
 
+def _load_encrypted_default_csv(path: Path) -> pd.DataFrame:
+    """加载加密默认 CSV（.csv.enc），解密后按长表格式处理。"""
+    from bundled_data_crypto import decrypt_file
+
+    raw = decrypt_file(path)
+    content = raw.decode("utf-8-sig", errors="ignore")
+    df = pd.read_csv(io.StringIO(content), dtype=str, keep_default_na=False)
+    if df.empty:
+        return df
+    df.columns = [str(c).strip().strip("\ufeff") for c in df.columns]
+    return _normalize_loaded_df(df, 园区名=None, default_园区_from=path.stem)
+
+
 def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     """确保列名唯一，避免 pd.concat 时报 InvalidIndexError。重复列名依次加后缀 _2, _3..."""
     if df.columns.is_unique:
@@ -307,13 +321,15 @@ def load_single_csv(path: str, 园区名: str = None) -> pd.DataFrame:
     若未传入 园区名，则从文件名中尝试解析（如含「燕园」则取燕园）。
     """
     path = Path(path)
-    if path.suffix.lower() not in (".csv", ".enc") and not path.name.endswith(".csv.enc"):
-        raise ValueError("仅支持 .csv 或 .csv.enc 文件")
-    # 特殊处理：工作簿2.csv、改良改造报表-V4.csv、改良改造报表-V4-sample.csv 等已预处理好的长表 CSV
-    if path.name == "工作簿2.csv" or path.name == "改良改造报表-V4.csv":
-        return _load_flat_progress_csv(path)
     if path.name == "改良改造报表-V4-sample.csv" or path.name == "改良改造报表-V4-sample.csv.enc":
         return _load_sample_csv(path)
+    if path.name.endswith(".csv.enc"):
+        return _load_encrypted_default_csv(path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError("仅支持 .csv 或 .csv.enc 文件")
+    # 特殊处理：工作簿2.csv、改良改造报表-V4.csv 等已预处理好的长表 CSV，第一行即为完整表头
+    if path.name == "工作簿2.csv" or path.name == "改良改造报表-V4.csv":
+        return _load_flat_progress_csv(path)
     names, encoding = _parse_header(str(path))
     # 时间节点列统一为简称（含「验收(社区结算)」「验收(社区需求完成交付)」等）
     for i, n in enumerate(names):

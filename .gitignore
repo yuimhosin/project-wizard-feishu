@@ -54,3 +54,5 @@ Untitled
 .vscode/
 *.swp
 *.swo
+*.pyc
+.DS_Store
