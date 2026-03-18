@@ -72,6 +72,7 @@ DEFAULT_DATA_DIR = str(ROOT_DIR)
 DEFAULT_SINGLE_FILE = str(ROOT_DIR / "改良改造报表-V4.csv")
 # 内嵌默认数据（加密 .enc，随 git 提交，Streamlit Cloud 部署用）
 DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
+LEGACY_DB_ROWS_TO_REPLACE = {337}
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
 专业大类 = [
@@ -5518,9 +5519,9 @@ def main():
                     st.info("请填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
 
         elif source == "数据库（团队共享）":
+            default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
             if df_db.empty:
                 # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
-                default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
                 if default_csv.exists():
                     try:
                         df = load_single_csv(str(default_csv))
@@ -5541,6 +5542,16 @@ def main():
                 else:
                     st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
             else:
+                if len(df_db) in LEGACY_DB_ROWS_TO_REPLACE and default_csv.exists():
+                    try:
+                        old_rows = len(df_db)
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            df_db = df_new
+                            st.warning(f"检测到历史旧数据（{old_rows} 条），已自动替换为「{default_csv.name}」最新数据，共 {len(df_new)} 条。")
+                    except Exception as e:
+                        st.warning(f"检测到历史旧数据但自动替换失败：{e}")
                 st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
                 df = df_db
 

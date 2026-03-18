@@ -42,6 +42,7 @@ DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
 DEFAULT_DATA_DIR = str(Path(__file__).resolve().parent)
 DEFAULT_ENCRYPTED_FILE = str(Path(__file__).resolve().parent / "改良改造报表-V4.csv.enc")
 DEFAULT_SINGLE_FILE = str(Path(__file__).resolve().parent / "改良改造报表-V4.csv")
+LEGACY_DB_ROWS_TO_REPLACE = {337}
 DEFAULT_FEISHU_DOC_URL = os.getenv(
     "FEISHU_DEFAULT_DOC_URL",
     "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA",
@@ -576,8 +577,8 @@ def main():
         df = pd.DataFrame()
 
         if source == "数据库（团队共享）":
+            default_csv = Path(DEFAULT_ENCRYPTED_FILE) if Path(DEFAULT_ENCRYPTED_FILE).exists() else Path(DEFAULT_SINGLE_FILE)
             if df_db.empty:
-                default_csv = Path(DEFAULT_ENCRYPTED_FILE) if Path(DEFAULT_ENCRYPTED_FILE).exists() else Path(DEFAULT_SINGLE_FILE)
                 if default_csv.exists():
                     try:
                         df = load_single_csv(str(default_csv))
@@ -598,6 +599,17 @@ def main():
                 else:
                     st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
             else:
+                # 兼容历史旧库：检测到旧版 337 条时，自动替换为新的默认加密数据
+                if len(df_db) in LEGACY_DB_ROWS_TO_REPLACE and default_csv.exists():
+                    try:
+                        old_rows = len(df_db)
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            df_db = df_new
+                            st.warning(f"检测到历史旧数据（{old_rows} 条），已自动替换为「{default_csv.name}」最新数据，共 {len(df_new)} 条。")
+                    except Exception as e:
+                        st.warning(f"检测到历史旧数据但自动替换失败：{e}")
                 st.success(f"已从数据库加载，共 {len(df_db)} 条记录。")
                 df = df_db
 
