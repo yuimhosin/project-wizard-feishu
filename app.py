@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from datetime import date, datetime
+import io
 import tempfile
 import os
 import sqlite3
@@ -246,6 +247,42 @@ def _get_next_序号(df: pd.DataFrame) -> int:
         return int(m) + 1 if pd.notna(m) else 1
     except Exception:
         return 1
+
+
+def _safe_sheet_name(name: str, used: set[str]) -> str:
+    """生成合法且唯一的 Excel sheet 名（<=31 字符）。"""
+    raw = str(name or "").strip() or "未命名"
+    for ch in ['\\', '/', '*', '?', ':', '[', ']']:
+        raw = raw.replace(ch, "_")
+    base = raw[:31] or "未命名"
+    candidate = base
+    idx = 2
+    while candidate in used:
+        suffix = f"_{idx}"
+        candidate = (base[: 31 - len(suffix)] + suffix) if len(base) + len(suffix) > 31 else (base + suffix)
+        idx += 1
+    used.add(candidate)
+    return candidate
+
+
+def _build_multisheet_excel_bytes(df: pd.DataFrame) -> bytes:
+    """导出为按园区分 sheet 的 Excel，同时保留全部项目总表。"""
+    output = io.BytesIO()
+    used_names: set[str] = set()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        all_sheet = _safe_sheet_name("全部项目", used_names)
+        df.to_excel(writer, index=False, sheet_name=all_sheet)
+
+        if "园区" in df.columns:
+            parks = sorted([p for p in df["园区"].dropna().astype(str).unique().tolist() if p and p != "nan"])
+            for park in parks:
+                sub = df[df["园区"].astype(str) == park].copy()
+                if sub.empty:
+                    continue
+                sheet = _safe_sheet_name(park, used_names)
+                sub.to_excel(writer, index=False, sheet_name=sheet)
+    output.seek(0)
+    return output.getvalue()
 
 
 def _render_project_wizard(df: pd.DataFrame):
@@ -753,6 +790,14 @@ def main():
 
     df = _canonicalize_df(df)
     df = _ensure_project_columns(df)
+
+    st.download_button(
+        "📥 导出Excel（按园区分Sheet）",
+        data=_build_multisheet_excel_bytes(df),
+        file_name=f"改良改造项目_分Sheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="导出包含「全部项目」总表，并按园区自动拆分多个工作表。",
+    )
     _render_project_wizard(df)
 
 
