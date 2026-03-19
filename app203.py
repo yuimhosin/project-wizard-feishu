@@ -10,10 +10,10 @@ import tempfile
 import io
 import base64
 import os
-import sqlite3
 import json
 import urllib.request
 from datetime import datetime, date
+from functools import lru_cache
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
@@ -127,30 +127,45 @@ def _date_to_str(d) -> str:
         return d.strftime("%Y-%m-%d")
     return str(d) if d else ""
 
-# ---------- 团队共享数据：SQLite 存储 ----------
+# ---------- 团队共享数据：数据库（默认 SQLite，可切换 Postgres/MySQL） ----------
+# 优先使用 APP203_DATABASE_URL（例如 postgres:// / mysql+pymysql://）。
+# 未设置时回退到本地 SQLite 文件（APP203_DB_PATH）。
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
+DB_URL = os.getenv("APP203_DATABASE_URL", "").strip()
 
 
-def _get_db_connection():
-    return sqlite3.connect(DB_PATH)
+def _sqlite_url_from_path(p: str) -> str:
+    fp = Path(p).expanduser().resolve()
+    # SQLAlchemy sqlite URL: sqlite:////absolute/path (Windows 也可用正斜杠)
+    return "sqlite:///" + fp.as_posix()
+
+
+@lru_cache(maxsize=1)
+def _get_db_engine():
+    from sqlalchemy import create_engine
+
+    url = DB_URL or _sqlite_url_from_path(DB_PATH)
+    # pool_pre_ping: 避免长连接断开导致的报错
+    return create_engine(url, pool_pre_ping=True, future=True)
 
 
 def load_from_db() -> pd.DataFrame:
-    """从 SQLite 加载团队共享数据表 projects。若不存在则返回空表。"""
-    if not Path(DB_PATH).exists():
-        return pd.DataFrame()
+    """加载团队共享数据表 projects。异常或表不存在则返回空表。"""
     try:
-        with _get_db_connection() as conn:
+        engine = _get_db_engine()
+        with engine.connect() as conn:
             return pd.read_sql("SELECT * FROM projects", conn)
     except Exception:
         return pd.DataFrame()
 
 
 def save_to_db(df: pd.DataFrame):
-    """将当前 DataFrame 全量写入 SQLite（覆盖 projects 表）。"""
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）。"""
     if df is None or df.empty:
         return
-    with _get_db_connection() as conn:
+    engine = _get_db_engine()
+    # 用事务保证 replace 的一致性
+    with engine.begin() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
 
 

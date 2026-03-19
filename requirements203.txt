@@ -8,3 +8,6 @@ kaleido>=0.2.1
 Pillow>=10.0.0
 weasyprint>=60.0
 playwright>=1.40.0
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+pymysql>=1.1.0
