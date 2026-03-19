@@ -1699,6 +1699,53 @@ def _add_城市和区域列(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _export_excel_by_园区_sheets(df: pd.DataFrame) -> bytes:
+    """导出 Excel：每个园区一个 sheet。返回 xlsx bytes。"""
+    import re
+
+    if df is None or df.empty:
+        return b""
+
+    if "园区" not in df.columns:
+        # 没有园区列就导出单 sheet
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="全部项目")
+        return buf.getvalue()
+
+    def sanitize_sheet_name(name: str) -> str:
+        s = str(name or "").strip()
+        if not s:
+            s = "未命名园区"
+        # Excel sheet 名不能包含: \ / ? * [ ]
+        s = re.sub(r"[:\\/?*\[\]]+", "_", s)
+        # 限制长度 31
+        s = s[:31].strip()
+        return s or "园区"
+
+    buf = io.BytesIO()
+    used = set()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        parks = df["园区"].dropna().astype(str).tolist()
+        parks = [p.strip() for p in parks if p and p.strip() and p.strip().lower() != "nan"]
+        unique_parks = sorted(set(parks))
+        if not unique_parks:
+            df.to_excel(writer, index=False, sheet_name="全部项目")
+        else:
+            for park in unique_parks:
+                sub = df[df["园区"].astype(str) == str(park)].copy()
+                sheet = sanitize_sheet_name(park)
+                base = sheet
+                i = 2
+                while sheet in used:
+                    suffix = f"_{i}"
+                    sheet = (base[: max(0, 31 - len(suffix))] + suffix)[:31]
+                    i += 1
+                used.add(sheet)
+                sub.to_excel(writer, index=False, sheet_name=sheet)
+    return buf.getvalue()
+
+
 def _build_城市_园区明细(df: pd.DataFrame) -> dict:
     """按城市汇总，每个城市下为各园区的：园区名称、项目总数、总预算。供地图 tooltip 使用。"""
     sub = df[df["城市"].notna() & (df["城市"] != "其他")]
@@ -5080,8 +5127,10 @@ def _render_project_wizard(df: pd.DataFrame):
         st.markdown("### 步骤 1：筛选要修改的项目")
         st.caption("先选园区，再在该园区内按项目名称选择要修改的那条记录。")
 
-        candidates = df_raw.copy()
-        parks_list = sorted(df_raw["园区"].dropna().astype(str).unique().tolist())
+        # 注意：不要用「序号」去全表定位记录，因为序号可能在不同园区重复。
+        # 这里统一用当前 DataFrame 的行索引作为行级 ID，确保选中哪条就编辑哪条。
+        candidates = df_all.copy()
+        parks_list = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
         parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
 
         if not parks_list:
@@ -5089,7 +5138,7 @@ def _render_project_wizard(df: pd.DataFrame):
             return
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
-        candidates = candidates[candidates["园区"].astype(str) == str(园区)]
+        candidates = candidates[candidates["园区"].astype(str) == str(园区)].copy()
         if candidates.empty:
             st.info("该园区下未找到项目记录，请尝试更换园区。")
             return
@@ -5099,36 +5148,34 @@ def _render_project_wizard(df: pd.DataFrame):
             return
 
         st.caption(f"在园区「{园区}」内找到 {len(candidates)} 条记录，请选择项目：")
-        display_cols = ["序号", "园区", "项目名称", "项目分级", "拟定金额"]
-        display_cols = [c for c in display_cols if c in candidates.columns]
-        st.dataframe(candidates[display_cols].head(50), use_container_width=True, hide_index=True)
 
-        if "项目名称" not in candidates.columns or "序号" not in candidates.columns:
-            st.error("数据缺少「项目名称」或「序号」列，无法进行按名称选择。")
+        if "项目名称" not in candidates.columns:
+            st.error("数据缺少「项目名称」列，无法进行按名称选择。")
             return
 
-        # 解决同名项目歧义：下拉展示“名称（序号）”，内部用序号定位
-        name_to_seq = {}
+        # 解决同名项目歧义：下拉展示“名称（园区/序号）”，内部用行索引定位
+        name_to_rowid = {}
         name_options = []
-        for _, r in candidates.iterrows():
-            seq_raw = r.get("序号", None)
-            seq_num = None
-            try:
-                if pd.notna(seq_raw):
-                    seq_num = int(float(seq_raw))
-            except Exception:
-                seq_num = None
-
+        for row_id, r in candidates.iterrows():
             nm_raw = r.get("项目名称", "")
             nm = str(nm_raw).strip() if nm_raw is not None else ""
             if not nm:
                 nm = "（未命名项目）"
 
-            if seq_num is None:
-                continue
-            label = f"{nm}（序号 {seq_num}）"
-            if label not in name_to_seq:
-                name_to_seq[label] = seq_num
+            seq_num = r.get("序号", "")
+            seq_str = ""
+            try:
+                if pd.notna(seq_num) and str(seq_num).strip() != "":
+                    seq_str = f"序号 {int(float(seq_num))}"
+            except Exception:
+                seq_str = f"序号 {str(seq_num).strip()}" if str(seq_num).strip() else ""
+
+            label = f"{nm}（{园区}{(' / ' + seq_str) if seq_str else ''}）"
+            # 极端情况下 label 重复，用行号兜底
+            if label in name_to_rowid:
+                label = f"{label} [行 {int(row_id)}]"
+            name_to_rowid[label] = int(row_id)
+            if label not in name_options:
                 name_options.append(label)
 
         if not name_options:
@@ -5136,42 +5183,64 @@ def _render_project_wizard(df: pd.DataFrame):
             return
 
         chosen_label = st.selectbox("项目名称*（下拉选择）", options=name_options, index=0, key="edit_name_select")
-        chosen_seq = name_to_seq[chosen_label]
-        target_row = df_all[df_all["序号"].astype(int) == int(chosen_seq)].iloc[0]
+        row_id = int(name_to_rowid[chosen_label])
+        target_row = df_all.loc[row_id]
 
+        # 选中项目详情展示（不再显示园区列表）
         st.markdown("---")
-        st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
+        st.markdown("### 已选择项目详情")
+        summary_cols = [c for c in ["序号", "园区", "项目名称", "项目分级", "项目分类", "专业", "专业分包", "拟定金额"] if c in df_all.columns]
+        if summary_cols:
+            st.dataframe(pd.DataFrame([target_row[summary_cols].to_dict()]), use_container_width=True, hide_index=True)
+        with st.expander("查看全部字段详情（含日期）", expanded=False):
+            # 以“字段-值”形式展示，便于一眼核对
+            full = target_row.to_dict()
+            show_items = []
+            for k, v in full.items():
+                if k is None:
+                    continue
+                ks = str(k).strip()
+                if not ks:
+                    continue
+                if ks.lower() in {"nan", "none", "null"}:
+                    continue
+                show_items.append({"字段": ks, "值": _format_cell(v)})
+            if show_items:
+                st.dataframe(pd.DataFrame(show_items), use_container_width=True, hide_index=True)
+            else:
+                st.info("暂无可展示字段。")
+
+        st.markdown("### 步骤 2：编辑项目")
         st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次修改的内容（含字段变更详情）将推送到飞书。")
 
-        seq_val = int(target_row["序号"])
+        # 展示用序号（可能跨园区重复，不作为唯一定位）
+        try:
+            seq_val = int(float(target_row.get("序号", 0) or 0))
+        except Exception:
+            seq_val = 0
 
         with st.expander("危险操作：删除该项目", expanded=False):
-            with st.form(f"delete_project_form_{seq_val}"):
+            with st.form(f"delete_project_form_{row_id}"):
                 st.warning("删除后将从团队共享数据库中移除该条记录，且不可恢复（除非重新导入原始数据）。")
                 delete_clicked = st.form_submit_button("🗑 删除该项目", type="primary")
             if delete_clicked:
-                df_new = df_all[df_all["序号"].astype(int) != seq_val].copy()
+                df_new = df_all.copy()
+                if row_id in df_new.index:
+                    df_new = df_new.drop(index=row_id)
                 save_to_db(df_new)
                 if _get_feishu_webhook_url():
                     diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
                     payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
                     push_to_feishu(payload=payload)
-                st.success(f"已删除序号为 {seq_val} 的项目。")
+                st.success(f"已删除项目（园区：{园区}，序号：{seq_val or '未知'}）。")
                 st.rerun()
 
-        st.markdown("### 修改入口（下拉选择后才显示详情）")
-        csel1, csel2 = st.columns(2)
-        with csel1:
-            timeline_opts = ["（不修改日期）"] + list(TIMELINE_COLS)
-            chosen_timeline_col = st.selectbox("日期更改（下拉选择节点）", options=timeline_opts, index=0, key=f"edit_date_menu_{seq_val}")
-        with csel2:
-            info_opts = ["（不修改项目信息）", "基础信息", "项目属性", "专业与名称"]
-            chosen_info_group = st.selectbox("项目信息修改（下拉选择类别）", options=info_opts, index=0, key=f"edit_info_menu_{seq_val}")
+        st.markdown("#### 更改项目进度")
+        timeline_opts = ["（不修改进度）"] + list(TIMELINE_COLS)
+        chosen_timeline_col = st.selectbox("选择要更新的进度节点", options=timeline_opts, index=0, key=f"edit_progress_menu_{row_id}")
 
-        if chosen_timeline_col and chosen_timeline_col != "（不修改日期）":
-            st.markdown("---")
-            st.markdown(f"#### 日期更改详情框：{chosen_timeline_col}")
-            with st.form(f"edit_date_form_{seq_val}"):
+        if chosen_timeline_col and chosen_timeline_col != "（不修改进度）":
+            with st.form(f"edit_progress_form_{row_id}"):
                 raw_val = target_row.get(chosen_timeline_col, "")
                 existing_d = _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
@@ -5181,17 +5250,17 @@ def _render_project_wizard(df: pd.DataFrame):
                     min_value=DATE_RANGE_MIN,
                     max_value=DATE_RANGE_MAX,
                     format="YYYY-MM-DD",
-                    key=f"edit_date_picker_{seq_val}_{chosen_timeline_col}",
+                    key=f"edit_progress_date_{row_id}_{chosen_timeline_col}",
                 )
-                save_date_clicked = st.form_submit_button("💾 保存日期更改")
+                save_date_clicked = st.form_submit_button("💾 保存进度更改")
+
             if save_date_clicked:
                 df_new = df_all.copy()
-                mask = df_new["序号"].astype(int) == seq_val
-                if chosen_timeline_col in df_new.columns:
-                    df_new.loc[mask, chosen_timeline_col] = _date_to_str(new_date)
+                if chosen_timeline_col in df_new.columns and row_id in df_new.index:
+                    df_new.loc[row_id, chosen_timeline_col] = _date_to_str(new_date)
                 save_to_db(df_new)
                 if _get_feishu_webhook_url():
-                    modified_row = df_new.loc[mask].iloc[0]
+                    modified_row = df_new.loc[row_id]
                     changes = [f"{chosen_timeline_col}：{_format_cell(target_row.get(chosen_timeline_col, '')) or '（空）'} → {_format_cell(modified_row.get(chosen_timeline_col, '')) or '（空）'}"]
                     modified_details = [{"序号": seq_val, "变更项": changes}]
                     diff = {
@@ -5200,125 +5269,128 @@ def _render_project_wizard(df: pd.DataFrame):
                         "modified": [_row_to_dict(modified_row)],
                         "modified_details": modified_details,
                     }
-                    payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-日期")
+                    payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-进度")
                     push_to_feishu(payload=payload)
-                st.success("已保存日期更改。")
+                st.success("已保存进度更改。")
                 st.rerun()
 
-        if chosen_info_group and chosen_info_group != "（不修改项目信息）":
-            st.markdown("---")
-            st.markdown(f"#### 项目信息修改详情框：{chosen_info_group}")
-            with st.form(f"edit_info_form_{seq_val}_{chosen_info_group}"):
+        st.markdown("---")
+        st.markdown("#### 项目信息更改")
+
+        # 园区/区域/城市：不可修改；区域/城市自动匹配并展示
+        current_park = str(target_row.get("园区", "") or "").strip()
+        matched_region = 园区_TO_区域.get(current_park, str(target_row.get("所属区域", "") or "").strip())
+        matched_city = 园区_TO_城市.get(current_park, str(target_row.get("城市", "") or "").strip())
+
+        st.text_input("园区（只读）", value=current_park, disabled=True, key=f"ro_park_{row_id}")
+        st.text_input("所属区域（自动匹配，只读）", value=str(matched_region or ""), disabled=True, key=f"ro_region_{row_id}")
+        st.text_input("城市（自动匹配，只读）", value=str(matched_city or ""), disabled=True, key=f"ro_city_{row_id}")
+
+        enable_info_edit = st.checkbox("启用项目信息修改", value=False, key=f"enable_info_edit_{row_id}")
+        if enable_info_edit:
+            with st.form(f"edit_info_form_{row_id}"):
                 updates = {}
 
-                if chosen_info_group == "基础信息":
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.text_input("序号（自动）", value=str(seq_val), disabled=True)
-                        园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
-                        园区默认 = str(target_row.get("园区", ""))
-                        园区2 = st.selectbox(
-                            "园区（选填）",
-                            options=[""] + 园区_options,
-                            index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
-                        )
-                        updates["园区"] = 园区2
-                    with c2:
-                        区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
-                        _v = str(target_row.get("所属区域", ""))
-                        所属区域 = st.selectbox("所属区域（选填）", options=[""] + 区域_opts, index=区域_opts.index(_v) + 1 if _v in 区域_opts else 0)
-                        updates["所属区域"] = 所属区域
-                    with c3:
-                        城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
-                        _cv = str(target_row.get("城市", ""))
-                        城市 = st.selectbox("所在城市（选填）", options=[""] + 城市_opts, index=城市_opts.index(_cv) + 1 if _cv in 城市_opts else 0)
-                        updates["城市"] = 城市
+                # 下拉选项准备
+                业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态) if "所属业态" in df_all.columns else []
+                分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级) if "项目分级" in df_all.columns else []
+                分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类) if "项目分类" in df_all.columns else []
+                承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织) if "拟定承建组织" in df_all.columns else []
+                总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x] if "总部重点关注项目" in df_all.columns else []
+                专业_opts = _get_dropdown_options(df_all, "专业", 专业大类) if "专业" in df_all.columns else []
+                分包_opts = _get_dropdown_options(df_all, "专业分包") if "专业分包" in df_all.columns else []
 
-                    业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
-                    _ev = str(target_row.get("所属业态", ""))
-                    所属业态 = st.selectbox("所属业态（选填）", options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts else 0)
-                    updates["所属业态"] = 所属业态
+                # 平铺展示所有可修改项目信息（除日期列，且园区/区域/城市不可改）
+                readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
+                editable_cols = [c for c in df_all.columns if c not in set(TIMELINE_COLS)]
+                editable_cols = [str(c).strip() for c in editable_cols if str(c).strip() and str(c).strip().lower() not in {"nan", "none", "null"}]
+                editable_cols = [c for c in editable_cols if c not in readonly_cols]
 
-                elif chosen_info_group == "项目属性":
-                    c4, c5, c6 = st.columns(3)
-                    with c4:
-                        分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
-                        _lv = str(target_row.get("项目分级", ""))
-                        项目分级 = st.selectbox("项目分级（选填）", options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts else 0)
-                        updates["项目分级"] = 项目分级
-                    with c5:
-                        分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
-                        _cv2 = str(target_row.get("项目分类", ""))
-                        项目分类 = st.selectbox("项目分类（选填）", options=[""] + 分类_opts, index=分类_opts.index(_cv2) + 1 if _cv2 in 分类_opts else 0)
-                        updates["项目分类"] = 项目分类
-                    with c6:
-                        承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
-                        _bv = str(target_row.get("拟定承建组织", ""))
-                        拟定承建组织 = st.selectbox("拟定承建组织（选填）", options=[""] + 承建_opts, index=承建_opts.index(_bv) + 1 if _bv in 承建_opts else 0)
-                        updates["拟定承建组织"] = 拟定承建组织
+                preferred_order = [
+                    "所属业态", "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+                    "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+                ]
+                editable_cols = [c for c in preferred_order if c in editable_cols] + [c for c in editable_cols if c not in preferred_order]
 
-                    c7, c8 = st.columns(2)
-                    with c7:
-                        总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
-                        _zv = str(target_row.get("总部重点关注项目", ""))
-                        总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts else 0)
-                        updates["总部重点关注项目"] = 总部重点关注项目
-                    with c8:
-                        拟定金额 = st.number_input("拟定金额（万元）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
-                        updates["拟定金额"] = 拟定金额
-
-                elif chosen_info_group == "专业与名称":
-                    c9, c10 = st.columns(2)
-                    with c9:
-                        专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
-                        _pv = str(target_row.get("专业", ""))
-                        专业 = st.selectbox("专业（选填）", options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts else 0)
-                        updates["专业"] = 专业
-                    with c10:
-                        分包_opts = _get_dropdown_options(df_all, "专业分包")
-                        _sbv = str(target_row.get("专业分包", ""))
-                        专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts, index=分包_opts.index(_sbv) + 1 if _sbv in 分包_opts else 0)
-                        updates["专业分包"] = 专业分包
-                    项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
-                    备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
-                    updates["项目名称"] = 项目名称
-                    updates["备注说明"] = 备注说明
+                colA, colB = st.columns(2)
+                col_cycle = [colA, colB]
+                ci = 0
+                for col in editable_cols:
+                    with col_cycle[ci % 2]:
+                        ci += 1
+                        current_val = target_row.get(col, "")
+                        if col == "所属业态" and 业态_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 业态_opts, index=(业态_opts.index(v) + 1) if v in 业态_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "项目分级" and 分级_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 分级_opts, index=(分级_opts.index(v) + 1) if v in 分级_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "项目分类" and 分类_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 分类_opts, index=(分类_opts.index(v) + 1) if v in 分类_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "拟定承建组织" and 承建_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 承建_opts, index=(承建_opts.index(v) + 1) if v in 承建_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "总部重点关注项目" and 总部_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 总部_opts, index=(总部_opts.index(v) + 1) if v in 总部_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "专业" and 专业_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 专业_opts, index=(专业_opts.index(v) + 1) if v in 专业_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "专业分包" and 分包_opts:
+                            v = str(current_val or "")
+                            updates[col] = st.selectbox(col, options=[""] + 分包_opts, index=(分包_opts.index(v) + 1) if v in 分包_opts else 0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "拟定金额":
+                            try:
+                                updates[col] = st.number_input(col, min_value=0.0, value=float(current_val or 0.0), step=1.0, key=f"edit_info_{row_id}_{col}")
+                            except Exception:
+                                updates[col] = st.number_input(col, min_value=0.0, value=0.0, step=1.0, key=f"edit_info_{row_id}_{col}")
+                        elif col == "备注说明":
+                            updates[col] = st.text_area(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
+                        else:
+                            updates[col] = st.text_input(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
 
                 save_info_clicked = st.form_submit_button("💾 保存项目信息更改")
 
-            if save_info_clicked:
-                if "拟定金额" in updates:
-                    if float(updates.get("拟定金额") or 0) <= 0:
-                        st.error("拟定金额需大于 0。")
-                        return
+                if save_info_clicked:
+                    if "拟定金额" in updates:
+                        if float(updates.get("拟定金额") or 0) <= 0:
+                            st.error("拟定金额需大于 0。")
+                            return
 
-                df_new = df_all.copy()
-                mask = df_new["序号"].astype(int) == seq_val
-                for col, val in updates.items():
-                    if col in df_new.columns:
-                        df_new.loc[mask, col] = val
-                save_to_db(df_new)
-                if _get_feishu_webhook_url():
-                    modified_row = df_new.loc[mask].iloc[0]
-                    changes = []
-                    for col in target_row.index:
-                        if col not in modified_row.index:
-                            continue
-                        ov = _format_cell(target_row[col])
-                        nv = _format_cell(modified_row[col])
-                        if ov != nv:
-                            changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
-                    modified_details = [{"序号": seq_val, "变更项": changes}]
-                    diff = {
-                        "deleted": [],
-                        "added": [],
-                        "modified": [_row_to_dict(modified_row)],
-                        "modified_details": modified_details,
-                    }
-                    payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-信息")
-                    push_to_feishu(payload=payload)
-                st.success("已保存项目信息更改。")
-                st.rerun()
+                    df_new = df_all.copy()
+                    if row_id in df_new.index:
+                        for col, val in updates.items():
+                            if col in df_new.columns:
+                                df_new.loc[row_id, col] = val
+                        # 后台自动匹配并写回（不可编辑但保持一致）
+                        if "所属区域" in df_new.columns:
+                            df_new.loc[row_id, "所属区域"] = matched_region or df_new.loc[row_id, "所属区域"]
+                        if "城市" in df_new.columns:
+                            df_new.loc[row_id, "城市"] = matched_city or df_new.loc[row_id, "城市"]
+
+                    save_to_db(df_new)
+                    if _get_feishu_webhook_url():
+                        modified_row = df_new.loc[row_id]
+                        changes = []
+                        for col in target_row.index:
+                            if col not in modified_row.index:
+                                continue
+                            ov = _format_cell(target_row[col])
+                            nv = _format_cell(modified_row[col])
+                            if ov != nv:
+                                changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+                        modified_details = [{"序号": seq_val, "变更项": changes}]
+                        diff = {
+                            "deleted": [],
+                            "added": [],
+                            "modified": [_row_to_dict(modified_row)],
+                            "modified_details": modified_details,
+                        }
+                        payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-信息")
+                        push_to_feishu(payload=payload)
+                    st.success("已保存项目信息更改。")
+                    st.rerun()
         return
 
     # ---------- 新增项目 ----------
@@ -5710,6 +5782,21 @@ def main():
     st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
     if _get_feishu_webhook_url():
         st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
+
+    with st.expander("📤 导出 Excel（按园区分表）", expanded=False):
+        st.caption("每个园区一个 sheet，便于按园区分发与归档。")
+        xlsx_bytes = _export_excel_by_园区_sheets(df)
+        if not xlsx_bytes:
+            st.info("当前无数据可导出。")
+        else:
+            filename = f"改良改造项目_按园区分表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            st.download_button(
+                "⬇️ 下载 Excel（按园区分表）",
+                data=xlsx_bytes,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
     _render_project_wizard(df)
 
 
