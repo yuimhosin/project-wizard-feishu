@@ -628,7 +628,11 @@ def _render_project_wizard(df: pd.DataFrame):
 
 
 def main():
-    st.set_page_config(page_title="养老社区项目向导", page_icon="🏠", layout="wide")
+    # 兼容入口：仓库默认用 app.py 启动。
+    # 将入口统一到 app203.py，避免两套 UI 逻辑分叉维护。
+    from app203 import main as _main_app203
+    _main_app203()
+    return
 
     if not _require_feishu_login():
         return
