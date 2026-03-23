@@ -18,3 +18,15 @@ FEISHU_REDIRECT_URI=http://localhost:8501/
 # 3. 网页应用 -> 添加 -> 在线网页 -> 桌面端主页：填授权链接（可选，工作台免登用）
 #    格式：https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=APPID&redirect_uri=ENCODED_REDIRECT_URI&scope=contact:user.base:readonly&state=default
 #    redirect_uri 需 URL 编码，如 http%3A%2F%2Flocalhost%3A8501%2F
+
+# ---------- 与 elderly-dashboard 共用的 MySQL（任选一种配置方式）----------
+# 方式 A：完整连接串（可与 Postgres 等混用）
+# APP203_DATABASE_URL=mysql+pymysql://用户:密码@主机:3306/数据库名?charset=utf8mb4
+
+# 方式 B：分项变量（推荐在 Streamlit Secrets 里与另一仓库填相同值）
+# MYSQL_HOST=xxx.rds.aliyuncs.com
+# MYSQL_PORT=3306
+# MYSQL_USER=app_user
+# MYSQL_PASSWORD=your_password
+# MYSQL_DATABASE=elderly_projects
+# 未配置 MySQL 时仍使用本地 SQLite：APP203_DB_PATH=app203_projects.db

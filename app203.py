@@ -14,6 +14,7 @@ import json
 import urllib.request
 from datetime import datetime, date
 from functools import lru_cache
+from urllib.parse import quote_plus
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
@@ -127,11 +128,10 @@ def _date_to_str(d) -> str:
         return d.strftime("%Y-%m-%d")
     return str(d) if d else ""
 
-# ---------- 团队共享数据：数据库（默认 SQLite，可切换 Postgres/MySQL） ----------
-# 优先使用 APP203_DATABASE_URL（例如 postgres:// / mysql+pymysql://）。
-# 未设置时回退到本地 SQLite 文件（APP203_DB_PATH）。
+# ---------- 团队共享数据：默认 SQLite，可与 elderly-dashboard 等共用 MySQL ----------
+# 优先级：APP203_DATABASE_URL > MYSQL_* 组合 > 本地 SQLite（APP203_DB_PATH）
+# 两仓库（elderly-dashboard / project-wizard-feishu）配置相同环境变量即可共用一张表。
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
-DB_URL = os.getenv("APP203_DATABASE_URL", "").strip()
 
 
 def _sqlite_url_from_path(p: str) -> str:
@@ -140,11 +140,35 @@ def _sqlite_url_from_path(p: str) -> str:
     return "sqlite:///" + fp.as_posix()
 
 
+def _resolve_database_url() -> str:
+    """解析数据库连接串：完整 URL 优先，其次 MYSQL_*，最后 SQLite。"""
+    explicit = os.getenv("APP203_DATABASE_URL", "").strip()
+    if explicit:
+        return explicit
+    host = os.getenv("MYSQL_HOST", "").strip()
+    if host:
+        user = os.getenv("MYSQL_USER", "").strip()
+        password = os.getenv("MYSQL_PASSWORD", "")
+        port = (os.getenv("MYSQL_PORT", "3306") or "3306").strip()
+        database = (
+            os.getenv("MYSQL_DATABASE", "").strip()
+            or os.getenv("MYSQL_DB", "").strip()
+        )
+        if user and database:
+            safe_pw = quote_plus(password)
+            safe_user = quote_plus(user)
+            return (
+                f"mysql+pymysql://{safe_user}:{safe_pw}@{host}:{port}/{database}"
+                "?charset=utf8mb4"
+            )
+    return _sqlite_url_from_path(DB_PATH)
+
+
 @lru_cache(maxsize=1)
 def _get_db_engine():
     from sqlalchemy import create_engine
 
-    url = DB_URL or _sqlite_url_from_path(DB_PATH)
+    url = _resolve_database_url()
     # pool_pre_ping: 避免长连接断开导致的报错
     return create_engine(url, pool_pre_ping=True, future=True)
 
