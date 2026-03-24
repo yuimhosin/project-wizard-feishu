@@ -31,6 +31,9 @@ except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
     sync_sheets_full_replace = None  # type: ignore
 
+# 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
+PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if str(x).strip()])
+
 try:
     from feishu_oauth import build_authorize_url, exchange_code_for_user
     FEISHU_OAUTH_AVAILABLE = True
@@ -5892,108 +5895,70 @@ def main():
             if not (bitable_url or "").strip():
                 st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。")
             else:
-                sheets_meta = []
-                sheet_names = []
-                if "/sheets/" in bitable_url:
-                    try:
-                        sheets_meta = list_sheets_from_sheets_url(bitable_url.strip())
-                    except Exception:
-                        sheets_meta = []
-                    sheet_names = [x.get("sheet_name", "") for x in sheets_meta if x.get("sheet_name")]
-                    st.caption(f"飞书 sheets/query 结构读取：{len(sheet_names)} 个园区（sheet 名）")
-                    st.session_state["feishu_sheet_names"] = sheet_names
-                    st.session_state["feishu_sheets_meta"] = sheets_meta
+                # 首屏性能优化：不自动请求飞书结构，优先使用预置社区列表
+                sheets_meta = st.session_state.get("feishu_sheets_meta") or []
+                if "/sheets/" in bitable_url and not st.session_state.get("feishu_sheet_names"):
+                    st.session_state["feishu_sheet_names"] = PRESET_COMMUNITIES
                 st.session_state["feishu_bitable_url"] = bitable_url.strip()
                 if "feishu_df_cache_by_sheet_id" not in st.session_state:
                     st.session_state["feishu_df_cache_by_sheet_id"] = {}
                 if load_all_sheets:
-                    st.session_state["feishu_default_parks"] = sheet_names
+                    st.session_state["feishu_default_parks"] = PRESET_COMMUNITIES
                 else:
-                    m = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", bitable_url.strip())
-                    target_sid = m.group(1) if m else ""
-                    default_name = ""
-                    if target_sid and sheets_meta:
-                        for x in sheets_meta:
-                            if str(x.get("sheet_id") or "").strip() == str(target_sid).strip():
-                                default_name = str(x.get("sheet_name") or "").strip()
-                                break
-                    if not default_name and sheets_meta:
-                        default_name = str(sheets_meta[0].get("sheet_name") or "").strip()
-                    st.session_state["feishu_default_parks"] = [default_name] if default_name else []
-
-                # 自动加载：页面打开后首次（或链接变化）自动从飞书拉取，无需手动点击按钮
-                auto_key = f"{bitable_url.strip()}|{1 if load_all_sheets else 0}"
-                if st.session_state.get("feishu_auto_loaded_key") != auto_key:
-                    with st.spinner("正在自动从飞书加载..."):
-                        loaded = load_from_bitable(
-                            bitable_url.strip(),
-                            load_all_sheets=load_all_sheets,
-                        )
-                    if loaded.empty:
-                        st.warning("自动加载未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
-                        try:
-                            err = get_bitable_last_error()
-                            if err:
-                                st.caption(f"飞书接口诊断：{err}")
-                        except Exception:
-                            pass
-                    else:
-                        save_to_db(loaded)
-                        st.session_state["feishu_auto_loaded_key"] = auto_key
-                        st.success(f"已自动从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。")
-                        st.rerun()
+                    st.session_state["feishu_default_parks"] = []
 
         df_db = load_from_db()
         df = df_db if not df_db.empty else pd.DataFrame()
         if not df.empty:
             st.caption(f"当前数据：共 {len(df)} 条。点击「从飞书加载」可从飞书刷新并覆盖本地缓存。")
 
+        park_col = None
         if not df.empty:
-            park_col = None
             if "园区" in df.columns:
                 park_col = "园区"
             elif "社区" in df.columns:
                 park_col = "社区"
-            if park_col:
-                # 若当前使用飞书 sheets：先用 sheets/query 的结构生成园区下拉（不依赖当前已加载的数据行）。
-                if st.session_state.get("feishu_sheet_names"):
-                    options = st.session_state.get("feishu_sheet_names") or []
-                    default_parks = st.session_state.get("feishu_default_parks") or []
-                    # 兜底：若默认空，则用当前 df 中实际存在的园区
-                    if not default_parks:
-                        parks = df[park_col].dropna().unique().tolist()
-                        parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
-                        default_parks = parks
-                    园区选择 = st.multiselect(
-                        "筛选园区",
-                        options=options,
-                        default=default_parks,
-                        key="park_filter_multiselect",
-                    )
-                else:
-                    parks = df[park_col].dropna().unique().tolist()
-                    parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
-                    if parks:
-                        园区选择 = st.multiselect("筛选园区", options=parks, default=parks)
-                    else:
-                        园区选择 = []
-            else:
-                st.info("当前数据未识别到「园区/社区」列，先按全部数据展示。")
-                园区选择 = []
+
+        # 首屏无数据时也展示预置社区筛选（用户选中后再懒加载对应分表）
+        if st.session_state.get("feishu_sheet_names"):
+            options = st.session_state.get("feishu_sheet_names") or []
+            default_parks = st.session_state.get("feishu_default_parks") or []
+            if park_col and not default_parks and not df.empty:
+                parks = df[park_col].dropna().unique().tolist()
+                parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
+                default_parks = parks
+            园区选择 = st.multiselect(
+                "筛选园区",
+                options=options,
+                default=default_parks,
+                key="park_filter_multiselect",
+            )
+        elif park_col:
+            parks = df[park_col].dropna().unique().tolist()
+            parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
+            园区选择 = st.multiselect("筛选园区", options=parks, default=parks) if parks else []
         else:
             园区选择 = []
 
     if df.empty:
-        st.warning("请先在侧边栏填写飞书多维表格链接并点击「从飞书加载」。")
+        st.warning("请先在侧边栏选择社区（筛选园区），系统会按需加载对应社区分表数据。")
         render_审核流程说明()
         return
 
     # 飞书 sheets：按需补齐所选园区的数据（避免首屏全量拉取过慢）
+    if 园区选择 and st.session_state.get("feishu_sheet_names"):
+        # 懒加载时才读取飞书结构，避免首屏阻塞
+        if not st.session_state.get("feishu_sheets_meta"):
+            try:
+                base_url = st.session_state.get("feishu_bitable_url") or ""
+                if "/sheets/" in str(base_url):
+                    st.session_state["feishu_sheets_meta"] = list_sheets_from_sheets_url(str(base_url).strip())
+            except Exception:
+                st.session_state["feishu_sheets_meta"] = []
+
     if (
         st.session_state.get("feishu_sheets_meta")
         and 园区选择
-        and not df.empty
-        and "园区" in df.columns
     ):
         meta = st.session_state.get("feishu_sheets_meta") or []
         park_to_sheet_id = {}
@@ -6003,7 +5968,7 @@ def main():
             if name and sid and name not in park_to_sheet_id:
                 park_to_sheet_id[name] = sid
 
-        have_parks = set(map(str, df["园区"].dropna().astype(str).unique().tolist()))
+        have_parks = set(map(str, df["园区"].dropna().astype(str).unique().tolist())) if (not df.empty and "园区" in df.columns) else set()
         missing_parks = [p for p in 园区选择 if p and str(p).strip() and str(p) not in have_parks]
         if missing_parks:
             loaded_additions = []
