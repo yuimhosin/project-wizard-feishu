@@ -726,7 +726,7 @@ def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: li
 def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool, str]:
     """
     将 DataFrame 全量覆盖写回飞书电子表格（Sheets）。
-    - 第 1 行写表头
+    - 保留原表头（不覆盖第 1 行），按原表头顺序写入数据
     - 第 2 行开始写数据（分块）
     - 若新数据比旧数据少，会把剩余区域清空
     """
@@ -745,26 +745,65 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         return False, "待写回数据为空。"
 
     # 保留业务列，跳过内部列
-    cols = [c for c in df_new.columns if str(c).strip() and not str(c).startswith("__")]
-    if not cols:
+    source_cols = [c for c in df_new.columns if str(c).strip() and not str(c).startswith("__")]
+    if not source_cols:
         return False, "无可写回列。"
+
+    # 读取原始表头，确保按原分表结构写入，避免“串列/错位”
+    try:
+        header_range = f"{sheet_id}!A1:ZZ1"
+        encoded_header = urllib.parse.quote(header_range, safe="")
+        header_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_header}"
+        req_header = urllib.request.Request(
+            header_url,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req_header, timeout=30) as resp:
+            header_data = json.loads(resp.read().decode())
+        if header_data.get("code") != 0:
+            return False, f"读取原表头失败：code={header_data.get('code')} msg={header_data.get('msg')}"
+        header_values = header_data.get("data", {}).get("valueRange", {}).get("values", []) or []
+        target_cols = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
+        target_cols = [c for c in target_cols if c]
+    except Exception as e:
+        return False, f"读取原表头异常：{_format_http_error(e)}"
+
+    if not target_cols:
+        # 极端兜底：若读不到原表头，则沿用当前数据列（不建议，但保证可写）
+        target_cols = [str(c).strip() for c in source_cols if str(c).strip()]
+    if not target_cols:
+        return False, "目标表头为空，无法写回。"
 
     # 旧行数（不含表头），用于清空尾部
     old_df = _load_from_sheets(spreadsheet_token, sheet_id, token)
     old_rows = 0 if old_df is None else len(old_df)
 
-    # 1) 写表头
-    last_col = _col_idx_to_letter(len(cols) - 1)
-    ok, err = _put_sheets_range(spreadsheet_token, sheet_id, f"A1:{last_col}1", [cols], token)
-    if not ok:
-        return False, f"写入表头失败：{err}"
+    # 1) 写数据（分块）- 从第2行开始，不覆盖原表头
+    last_col = _col_idx_to_letter(len(target_cols) - 1)
 
-    # 2) 写数据（分块）
+    def _resolve_source_col(target_col: str) -> str | None:
+        # 直接命中
+        if target_col in source_cols:
+            return target_col
+        # 常见别名兼容
+        if target_col == "拟定金额" and "实际预计金额" in source_cols:
+            return "实际预计金额"
+        # 去括号弱匹配（例如 验收(社区需求完成交付) -> 验收）
+        tc_base = re.sub(r"[（(].*?[)）]", "", str(target_col)).strip()
+        for sc in source_cols:
+            scs = str(sc).strip()
+            sc_base = re.sub(r"[（(].*?[)）]", "", scs).strip()
+            if scs == target_col or sc_base == tc_base:
+                return sc
+        return None
+
     values = []
     for _, row in df_new.iterrows():
         one = []
-        for c in cols:
-            v = row.get(c, "")
+        for tc in target_cols:
+            src = _resolve_source_col(tc)
+            v = row.get(src, "") if src else ""
             if pd.isna(v) or v is None:
                 one.append("")
             elif isinstance(v, (int, float)):
@@ -772,6 +811,8 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
             else:
                 one.append(str(v))
         values.append(one)
+    if not values:
+        return False, "写回数据为空（过滤后无可写入行）。"
 
     chunk_size = 400
     for i in range(0, len(values), chunk_size):
@@ -788,13 +829,13 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         if not ok:
             return False, f"写入数据失败（{start}-{end}）：{err}"
 
-    # 3) 清空尾部旧数据（仅清空，不删行）
+    # 2) 清空尾部旧数据（仅清空，不删行）
     new_rows = len(values)
     if old_rows > new_rows:
         blank_rows = old_rows - new_rows
         start = new_rows + 2
         end = old_rows + 1
-        blanks = [["" for _ in cols] for _ in range(blank_rows)]
+        blanks = [["" for _ in target_cols] for _ in range(blank_rows)]
         for i in range(0, len(blanks), chunk_size):
             chunk = blanks[i : i + chunk_size]
             s = start + i
