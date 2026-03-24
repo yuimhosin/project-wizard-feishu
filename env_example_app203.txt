@@ -1,9 +1,14 @@
 # 养老社区改良改造看板 - 飞书登录与工作台免登
 # 复制到 .env 或 .streamlit/secrets.toml 中配置
 
-# 飞书应用（登录、多维表格、Webhook 共用）
+# 飞书应用（登录、多维表格/电子表格、Webhook 共用）
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
+
+# 默认表格链接（可选；侧栏默认值，也可用 FEISHU_TABLE_URL / FEISHU_BITABLE_URL）
+# 电子表格示例：https://xxx.feishu.cn/sheets/{token}?sheet={子表id}
+# 需在开放平台为应用开通 drive / sheets 等相关权限（只读或读写视需求）
+# FEISHU_TABLE_URL=https://tkhome.feishu.cn/sheets/WHpesgmsohOVpLtdokocXotsnfe?sheet=dAFcmN
 
 # 飞书登录门禁：设为 1 启用，未登录无法查看内容
 FEISHU_LOGIN_REQUIRED=1

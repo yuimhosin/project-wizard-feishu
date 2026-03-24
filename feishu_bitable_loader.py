@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""飞书多维表格数据加载：从飞书 Bitable 读取养老社区进度表数据。"""
+"""飞书数据加载与同步：多维表格（Bitable）与电子表格（Sheets）。"""
 import os
 import re
 import json
@@ -7,6 +7,7 @@ import time
 import urllib.request
 import urllib.error
 from typing import Optional
+from urllib.parse import quote
 
 import pandas as pd
 
@@ -403,3 +404,453 @@ def sync_bitable_df_diff(
     if not msgs:
         return True, "飞书侧无变更（与上次一致）。", None
     return True, "；".join(msgs), df_patch if any_new_fill else None
+
+
+# ---------- 飞书电子表格（Sheets）：与多维表格共用 tenant_access_token ----------
+def _is_sheets_url(url_or_id: str) -> bool:
+    s = (url_or_id or "").strip()
+    return bool(re.search(r"/sheets/[A-Za-z0-9]+", s))
+
+
+def _parse_sheets_url(url_or_id: str) -> tuple[str, str] | None:
+    """
+    解析电子表格链接：https://xxx.feishu.cn/sheets/{spreadsheet_token}?sheet={sheet_id}
+    返回 (spreadsheet_token, sheet_id)；sheet_id 可为空（将取第一个工作表）。
+    """
+    s = (url_or_id or "").strip()
+    m = re.search(r"/sheets/([A-Za-z0-9]+)", s)
+    if not m:
+        return None
+    spreadsheet_token = m.group(1)
+    sheet_m = re.search(r"[?&]sheet=([A-Za-z0-9]+)", s)
+    sheet_id = sheet_m.group(1) if sheet_m else ""
+    return spreadsheet_token, sheet_id
+
+
+def _sheet_join_range(sheet_id: str, a1: str) -> str:
+    return f"{sheet_id}!{a1}"
+
+
+def _col_idx_to_letter(idx: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA"""
+    n = idx + 1
+    letters: list[str] = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(65 + rem))
+    return "".join(reversed(letters))
+
+
+def _flatten_sheet_cell(v) -> str | int | float:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, list):
+        parts = []
+        for item in v:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("name") or item))
+            else:
+                parts.append(str(item))
+        return "; ".join(parts) if parts else ""
+    if isinstance(v, dict):
+        return str(v.get("text") or v.get("name") or str(v))
+    return str(v)
+
+
+def _get_first_sheet_id(spreadsheet_token: str, token: str) -> Optional[str]:
+    url = f"{FEISHU_API_BASE}/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") != 0:
+            return None
+        d = data.get("data") or {}
+        sheets = d.get("sheets") or d.get("items") or []
+        if isinstance(sheets, list) and sheets:
+            sid = sheets[0].get("sheet_id") or sheets[0].get("sheetId")
+            if sid:
+                return str(sid).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _read_sheet_values_raw(
+    spreadsheet_token: str, sheet_id: str, token: str
+) -> tuple[list[list], str]:
+    rng = _sheet_join_range(sheet_id, "A1:ZZ10000")
+    q = quote(rng, safe="")
+    last_err = ""
+    for prefix in ("sheets", "sheet"):
+        url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/values/{q}"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("code") == 0:
+                values = (data.get("data") or {}).get("valueRange", {}).get("values") or []
+                return values, ""
+            last_err = f"code={data.get('code')} msg={data.get('msg')}"
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+            last_err = f"HTTP {e.code} {raw}"
+        except Exception as e:
+            last_err = str(e)
+    return [], last_err or "读取电子表格失败"
+
+
+def load_from_sheets(url_or_id: str) -> pd.DataFrame:
+    """
+    从飞书电子表格加载为 DataFrame。首行作为表头；__feishu_record_id 为工作表行号（1 起，与飞书行号一致）。
+    需配置 FEISHU_APP_ID、FEISHU_APP_SECRET，且应用具备 sheets:spreadsheet 或只读权限。
+    """
+    token = _get_tenant_access_token()
+    if not token:
+        return pd.DataFrame()
+
+    parsed = _parse_sheets_url(url_or_id)
+    if not parsed:
+        return pd.DataFrame()
+    spreadsheet_token, sheet_id = parsed
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not sheet_id:
+        return pd.DataFrame()
+
+    values, err = _read_sheet_values_raw(spreadsheet_token, sheet_id, token)
+    if not values:
+        return pd.DataFrame()
+
+    raw_header = [str(x).strip() if x is not None else "" for x in values[0]]
+    header: list[str] = []
+    dup_count: dict[str, int] = {}
+    for i, h in enumerate(raw_header):
+        base = h if h else f"列{i + 1}"
+        if base in dup_count:
+            dup_count[base] += 1
+            base = f"{base}_{dup_count[base]}"
+        else:
+            dup_count[base] = 0
+        header.append(base)
+
+    rows_out: list[dict] = []
+    for row_idx, row in enumerate(values[1:], start=2):
+        sheet_row = row_idx
+        rec: dict = {FEISHU_RECORD_ID_COL: str(sheet_row)}
+        for j, col_name in enumerate(header):
+            cell = row[j] if j < len(row) else None
+            rec[col_name] = _flatten_sheet_cell(cell)
+        rows_out.append(rec)
+
+    return pd.DataFrame(rows_out)
+
+
+def resolve_sheets_for_sync(url_or_id: str) -> tuple[str, str] | None:
+    """解析电子表格链接为 (spreadsheet_token, sheet_id)，失败返回 None。"""
+    token = _get_tenant_access_token()
+    if not token:
+        return None
+    parsed = _parse_sheets_url(url_or_id)
+    if not parsed:
+        return None
+    spreadsheet_token, sheet_id = parsed
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not spreadsheet_token or not sheet_id:
+        return None
+    return spreadsheet_token, sheet_id
+
+
+def _row_to_sheet_values(row: pd.Series, col_order: list[str]) -> list:
+    out: list = []
+    for c in col_order:
+        ks = str(c).strip()
+        v = row.get(c) if hasattr(row, "get") else row[c]
+        if pd.isna(v) or v is None:
+            out.append("")
+            continue
+        if isinstance(v, bool):
+            out.append("是" if v else "否")
+            continue
+        if isinstance(v, (int, float)):
+            if ks == "实际预计金额" or ks.endswith("金额"):
+                try:
+                    out.append(float(v))
+                except Exception:
+                    out.append(str(v).strip())
+            else:
+                out.append(str(v).strip())
+            continue
+        out.append(str(v).strip())
+    return out
+
+
+def _put_sheet_values(
+    spreadsheet_token: str, range_full: str, values_rows: list[list], token: str
+) -> str:
+    body = {"valueRange": {"range": range_full, "values": values_rows}}
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    last_err = ""
+    for prefix in ("sheets", "sheet"):
+        url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/values"
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("code") == 0:
+                return ""
+            last_err = f"code={data.get('code')} msg={data.get('msg')}"
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+            last_err = f"HTTP {e.code} {raw}"
+        except Exception as e:
+            last_err = str(e)
+    return last_err or "写入失败"
+
+
+def _post_values_batch_update(
+    spreadsheet_token: str, value_ranges: list[dict], token: str
+) -> str:
+    body = {"valueRanges": value_ranges}
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    last_err = ""
+    for prefix in ("sheets", "sheet"):
+        url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("code") == 0:
+                return ""
+            last_err = f"code={data.get('code')} msg={data.get('msg')}"
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+            last_err = f"HTTP {e.code} {raw}"
+        except Exception as e:
+            last_err = str(e)
+    return last_err or "批量写入失败"
+
+
+def _delete_sheet_row_1based(
+    spreadsheet_token: str, sheet_id: str, row_1based: int, token: str
+) -> str:
+    """删除工作表中的第 row_1based 行（1 起计，含表头行）。"""
+    si = max(0, row_1based - 1)
+    ei = row_1based
+    body = {
+        "dimension": {
+            "sheetId": sheet_id,
+            "majorDimension": "ROWS",
+            "startIndex": si,
+            "endIndex": ei,
+        }
+    }
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    last_err = ""
+    for prefix in ("sheets", "sheet"):
+        url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/dimension_range"
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            method="DELETE",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("code") == 0:
+                return ""
+            last_err = f"code={data.get('code')} msg={data.get('msg')}"
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+            last_err = f"HTTP {e.code} {raw}"
+        except Exception as e:
+            last_err = str(e)
+    return last_err or "删除行失败"
+
+
+def sync_sheets_df_diff(
+    url: str,
+    df_old: pd.DataFrame,
+    df_new: pd.DataFrame,
+) -> tuple[bool, str, pd.DataFrame | None]:
+    """
+    将变更同步到飞书电子表格：先更新、再追加、再自下而上删除行，最后重新加载以刷新行号。
+    """
+    resolved = resolve_sheets_for_sync(url)
+    if not resolved:
+        return False, "无法解析电子表格链接或无权访问。", None
+    spreadsheet_token, sheet_id = resolved
+
+    token = _get_tenant_access_token()
+    if not token:
+        return False, "无法获取飞书 tenant_access_token。", None
+
+    id_col = FEISHU_RECORD_ID_COL
+    msgs: list[str] = []
+
+    def _visible_cols(df: pd.DataFrame) -> list[str]:
+        return [
+            c
+            for c in df.columns
+            if str(c).strip() and c != id_col and not str(c).startswith("__")
+        ]
+
+    cols_new = _visible_cols(df_new)
+    if not cols_new:
+        return False, "无有效列可同步。", None
+
+    def _collect_numeric_ids(df: pd.DataFrame) -> set[str]:
+        if df is None or df.empty or id_col not in df.columns:
+            return set()
+        out: set[str] = set()
+        for x in df[id_col].tolist():
+            s = str(x).strip()
+            if s and s.isdigit():
+                out.add(s)
+        return out
+
+    old_ids = _collect_numeric_ids(df_old)
+    new_ids = _collect_numeric_ids(df_new)
+    to_delete = sorted((old_ids - new_ids), key=int, reverse=True)
+
+    old_by_id: dict[str, pd.Series] = {}
+    if df_old is not None and not df_old.empty and id_col in df_old.columns:
+        for _, r in df_old.iterrows():
+            rid = str(r.get(id_col, "") or "").strip()
+            if rid.isdigit():
+                old_by_id[rid] = r
+
+    last_col = _col_idx_to_letter(len(cols_new) - 1)
+
+    # 1) 更新（排除即将删除的行）
+    batch: list[dict] = []
+    for _, row in df_new.iterrows():
+        rid = str(row.get(id_col, "") or "").strip()
+        if not rid.isdigit() or rid in to_delete:
+            continue
+        old_row = old_by_id.get(rid)
+        if old_row is None:
+            continue
+        if _rows_equal_for_sync(row, old_row):
+            continue
+        rnum = int(rid)
+        if rnum < 2:
+            continue
+        vals = _row_to_sheet_values(row, cols_new)
+        rng = _sheet_join_range(sheet_id, f"A{rnum}:{last_col}{rnum}")
+        batch.append({"range": rng, "values": [vals]})
+
+    for i in range(0, len(batch), 50):
+        chunk = batch[i : i + 50]
+        err = _post_values_batch_update(spreadsheet_token, chunk, token)
+        if err:
+            return False, f"飞书更新行失败：{err}", None
+        msgs.append(f"更新 {len(chunk)} 行")
+
+    # 2) 追加（无行号）
+    max_row = 1
+    for rid in new_ids:
+        if rid.isdigit():
+            max_row = max(max_row, int(rid))
+    next_row = max_row + 1
+    new_idx_list: list = []
+    for idx, row in df_new.iterrows():
+        rid = str(row.get(id_col, "") or "").strip()
+        if rid and rid.isdigit():
+            continue
+        new_idx_list.append(idx)
+
+    df_patch = df_new.copy()
+    for k, idx in enumerate(new_idx_list):
+        row = df_new.loc[idx]
+        rnum = next_row + k
+        vals = _row_to_sheet_values(row, cols_new)
+        rng = _sheet_join_range(sheet_id, f"A{rnum}:{last_col}{rnum}")
+        err = _put_sheet_values(spreadsheet_token, rng, [vals], token)
+        if err:
+            return False, f"飞书新增行失败：{err}", None
+        df_patch.at[idx, id_col] = str(rnum)
+        msgs.append(f"新增行 {rnum}")
+
+    # 3) 删除（自下而上）
+    for rid in to_delete:
+        r = int(rid)
+        if r < 2:
+            continue
+        err = _delete_sheet_row_1based(spreadsheet_token, sheet_id, r, token)
+        if err:
+            return False, f"飞书删除行失败：{err}", None
+        msgs.append(f"删除行 {r}")
+
+    if not msgs:
+        return True, "飞书电子表格无变更（与上次一致）。", None
+
+    df_fresh = load_from_sheets(url)
+    if df_fresh.empty:
+        return True, "；".join(msgs) + "（已同步，但重新加载表格为空，请检查权限。）", None
+    return True, "；".join(msgs), df_fresh
+
+
+def load_from_feishu(url_or_id: str) -> pd.DataFrame:
+    """从飞书加载：电子表格（/sheets/）走 Sheets API，否则走多维表格 Bitable。"""
+    if _is_sheets_url(url_or_id):
+        return load_from_sheets(url_or_id)
+    return load_from_bitable(url_or_id)
+
+
+def sync_feishu_diff(
+    url: str,
+    df_old: pd.DataFrame,
+    df_new: pd.DataFrame,
+) -> tuple[bool, str, pd.DataFrame | None]:
+    """根据链接类型同步到飞书：电子表格或多维表格。"""
+    if _is_sheets_url(url):
+        return sync_sheets_df_diff(url, df_old, df_new)
+    return sync_bitable_df_diff(url, df_old, df_new)

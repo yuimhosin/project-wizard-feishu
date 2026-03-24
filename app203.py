@@ -20,14 +20,15 @@ from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
     from feishu_bitable_loader import (
-        load_from_bitable,
-        sync_bitable_df_diff,
+        load_from_feishu,
+        sync_feishu_diff,
         FEISHU_RECORD_ID_COL,
     )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
-    sync_bitable_df_diff = None  # type: ignore
+    sync_feishu_diff = None  # type: ignore
+    load_from_feishu = None  # type: ignore
     FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 try:
@@ -131,6 +132,47 @@ def _date_to_str(d) -> str:
 # 两仓库（elderly-dashboard / project-wizard-feishu）配置相同环境变量即可共用一张表。
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
 
+# 默认数据源：飞书电子表格（可在 Secrets / 环境变量 FEISHU_TABLE_URL、FEISHU_BITABLE_URL 覆盖）
+DEFAULT_FEISHU_TABLE_URL = (
+    "https://tkhome.feishu.cn/sheets/WHpesgmsohOVpLtdokocXotsnfe?sheet=dAFcmN"
+)
+
+
+def _feishu_env_or_secret(key: str) -> str:
+    v = os.getenv(key, "").strip()
+    if v:
+        return v
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            val = st.secrets.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _feishu_table_url_from_secrets_or_env() -> str:
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for k in ("FEISHU_TABLE_URL", "FEISHU_BITABLE_URL"):
+                try:
+                    v = st.secrets[k]
+                    if v and str(v).strip():
+                        return str(v).strip()
+                except (KeyError, TypeError, AttributeError):
+                    continue
+    except Exception:
+        pass
+    return (os.getenv("FEISHU_TABLE_URL") or os.getenv("FEISHU_BITABLE_URL") or "").strip()
+
+
+def _default_feishu_table_url() -> str:
+    v = _feishu_table_url_from_secrets_or_env()
+    if v:
+        return v
+    return DEFAULT_FEISHU_TABLE_URL
+
 
 def _sqlite_url_from_path(p: str) -> str:
     fp = Path(p).expanduser().resolve()
@@ -182,14 +224,18 @@ def load_from_db() -> pd.DataFrame:
 
 
 def _get_feishu_sync_url() -> str | None:
-    """用于写回飞书多维表格的链接：优先当前侧边栏已同步的 URL，其次环境变量。"""
+    """用于写回飞书的链接：优先 session，其次上次侧栏写入，再 Secrets/环境变量。"""
     try:
         u = st.session_state.get("feishu_bitable_url")
         if u and str(u).strip():
             return str(u).strip()
     except Exception:
         pass
-    return (os.getenv("FEISHU_LAST_BITABLE_URL") or os.getenv("FEISHU_BITABLE_URL") or "").strip() or None
+    last = (os.getenv("FEISHU_LAST_BITABLE_URL") or "").strip()
+    if last:
+        return last
+    fe = _feishu_table_url_from_secrets_or_env()
+    return fe or None
 
 
 def _remember_bitable_url_from_sidebar(bitable_url: str) -> None:
@@ -209,7 +255,7 @@ def _remember_bitable_url_from_sidebar(bitable_url: str) -> None:
 
 
 def save_to_db(df: pd.DataFrame, sync_feishu: bool = True):
-    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）；可选同步变更到飞书多维表格。"""
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）；可选同步变更到飞书（多维表格或电子表格）。"""
     if df is None or df.empty:
         return
     try:
@@ -219,7 +265,7 @@ def save_to_db(df: pd.DataFrame, sync_feishu: bool = True):
     engine = _get_db_engine()
     with engine.begin() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
-    if not sync_feishu or not FEISHU_BITABLE_AVAILABLE or sync_bitable_df_diff is None:
+    if not sync_feishu or not FEISHU_BITABLE_AVAILABLE or sync_feishu_diff is None:
         return
     url = _get_feishu_sync_url()
     if not url:
@@ -231,7 +277,7 @@ def save_to_db(df: pd.DataFrame, sync_feishu: bool = True):
             pass
         return
     try:
-        ok, msg, df_patched = sync_bitable_df_diff(url, df_old, df)
+        ok, msg, df_patched = sync_feishu_diff(url, df_old, df)
         if ok and df_patched is not None:
             save_to_db(df_patched, sync_feishu=False)
         try:
@@ -5699,33 +5745,34 @@ def main():
                 st.rerun()
         st.header("数据源")
         st.caption(
-            "数据来源仅支持飞书多维表格。加载后会在本机/服务器写入 SQLite 作为缓存，便于多人共用与快速打开。"
-            "在向导里保存修改时，会同时尝试写回飞书表格（需左侧已填写链接且应用具备写权限）；"
-            "若写回失败会页面提示，此时数据仍保存在本地缓存中。"
+            "支持飞书多维表格（Bitable）与电子表格（Sheets）。加载后写入 SQLite 缓存；"
+            "在向导中保存时会尝试写回飞书（需左侧链接且应用具备相应权限）。"
+            "电子表格示例：…/sheets/{表格token}?sheet={子表id}；多维表格：…/base/… 或 wiki 且含 ?table=表id。"
         )
 
         if not FEISHU_BITABLE_AVAILABLE:
             st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
-        elif not os.getenv("FEISHU_APP_ID") or not os.getenv("FEISHU_APP_SECRET"):
+        elif not _feishu_env_or_secret("FEISHU_APP_ID") or not _feishu_env_or_secret("FEISHU_APP_SECRET"):
             st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
         else:
             bitable_url = st.text_input(
-                "飞书多维表格链接",
-                value=os.getenv(
-                    "FEISHU_BITABLE_URL",
-                    "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
-                ),
-                placeholder="https://xxx.feishu.cn/base/AppToken 或 wiki 链接含 ?table=TableId",
+                "飞书表格链接",
+                value=_default_feishu_table_url(),
+                placeholder="https://xxx.feishu.cn/sheets/...?sheet=... 或 base/wiki 多维表格链接",
             )
             _remember_bitable_url_from_sidebar(bitable_url)
             if st.button("🔄 从飞书加载", key="load_feishu"):
                 if not (bitable_url or "").strip():
-                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
+                    st.warning(
+                        "请先填写飞书表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。"
+                    )
                 else:
                     with st.spinner("正在从飞书加载..."):
-                        loaded = load_from_bitable(bitable_url.strip())
+                        loaded = load_from_feishu(bitable_url.strip())
                     if loaded.empty:
-                        st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
+                        st.warning(
+                            "未获取到数据，请检查链接和权限（应用需具备该电子表格/多维表格的读取权限）。"
+                        )
                     else:
                         st.session_state["feishu_bitable_url"] = bitable_url.strip()
                         os.environ["FEISHU_LAST_BITABLE_URL"] = bitable_url.strip()
@@ -5733,7 +5780,9 @@ def main():
                         msg = f"已从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。"
                         if _get_feishu_webhook_url():
                             try:
-                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(loaded)} 条记录。"):
+                                if push_to_feishu(
+                                    f"【养老社区进度表】已从飞书导入，共 {len(loaded)} 条记录。"
+                                ):
                                     st.success(msg + " 已推送通知至飞书。")
                                 else:
                                     st.success(msg)
@@ -5760,7 +5809,7 @@ def main():
             园区选择 = []
 
     if df.empty:
-        st.warning("请先在侧边栏填写飞书多维表格链接并点击「从飞书加载」。")
+        st.warning("请先在侧边栏填写飞书表格链接并点击「从飞书加载」。")
         render_审核流程说明()
         return
 
