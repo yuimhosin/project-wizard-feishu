@@ -276,6 +276,7 @@ def save_to_db(df: pd.DataFrame):
     """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。"""
     if df is None or df.empty:
         return
+    df = _dedupe_columns(df)
     engine = _get_db_engine()
     # 用事务保证 replace 的一致性
     with engine.begin() as conn:
@@ -330,6 +331,29 @@ def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out.iloc[:, out_idx].copy()
 
 
+def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """列名去重：重复列自动追加后缀，避免 to_sql 报 DuplicateColumnError。"""
+    if df is None or df.empty:
+        return df
+    cols = [str(c).strip() if str(c).strip() else "列" for c in df.columns]
+    seen: dict[str, int] = {}
+    new_cols: list[str] = []
+    changed = False
+    for c in cols:
+        n = seen.get(c, 0) + 1
+        seen[c] = n
+        if n == 1:
+            new_cols.append(c)
+        else:
+            changed = True
+            new_cols.append(f"{c}_{n}")
+    if not changed:
+        return df
+    out = df.copy()
+    out.columns = new_cols
+    return out
+
+
 def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     加载后统一规范化：只保留分析所需列、合并城市列、固定列顺序，避免多列/错位导致后面列显示为空。
@@ -338,6 +362,7 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df.copy()
     out = _strip_empty_columns(out)
+    out = _dedupe_columns(out)
     if "社区" in out.columns and "园区" not in out.columns:
         out = out.rename(columns={"社区": "园区"})
     elif "社区" in out.columns and "园区" in out.columns:
