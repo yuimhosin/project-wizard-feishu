@@ -307,6 +307,47 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
             _set_last_error("首行未检测到表头，请确认第一行为字段名。")
             return pd.DataFrame()
 
+        # 再读第二行，适配“燕园 0~7 + 第二行真实节点名”以及“预计节点（月）+ 第二行节点名”结构
+        header2 = []
+        try:
+            h2_range = f"{sheet_id}!A2:ZZ2"
+            h2_encoded = urllib.parse.quote(h2_range, safe="")
+            h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_encoded}"
+            h2_req = urllib.request.Request(
+                h2_url,
+                method="GET",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(h2_req, timeout=30) as resp:
+                h2_data = json.loads(resp.read().decode())
+            if h2_data.get("code") == 0:
+                h2_values = (h2_data.get("data") or {}).get("valueRange", {}).get("values", []) or []
+                if h2_values:
+                    header2 = [str(v).strip() if v is not None else "" for v in h2_values[0]]
+        except Exception:
+            header2 = []
+
+        timeline_like = {
+            "需求立项", "需求审核", "规划设计方案", "成本核算", "项目决策",
+            "招采", "实施", "验收(社区需求完成交付)", "验收", "结算",
+            "文字说明及构思", "形成方案", "运保总部审核", "上联席会", "立项呈批", "预算动支发起",
+        }
+        merged_header = []
+        for i, h1 in enumerate(header):
+            h2 = header2[i] if i < len(header2) else ""
+            h1s = str(h1).strip()
+            h2s = str(h2).strip()
+            # 规则1：首行是 0~7 等占位编号，用第二行真实节点名替换
+            if re.fullmatch(r"\d+", h1s or "") and h2s:
+                merged_header.append(h2s)
+                continue
+            # 规则2：首行为空，但第二行是节点名，使用第二行
+            if not h1s and h2s in timeline_like:
+                merged_header.append(h2s)
+                continue
+            merged_header.append(h1s)
+        header = merged_header
+
         # 处理重复/空表头，避免 DataFrame 列名冲突
         used = {}
         cols = []

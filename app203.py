@@ -35,6 +35,19 @@ except ImportError:
 PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if str(x).strip()])
 EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
 
+# 燕园等分表“阶段式表头”到标准节点列名的别名映射
+TIMELINE_ALIAS_MAP = {
+    "需求立项": ["文字说明及构思"],
+    "需求审核": ["形成方案"],
+    "规划设计方案": ["运保总部审核"],
+    "成本核算": ["上联席会"],
+    "项目决策": ["立项呈批", "预算动支发起"],
+    "招采": ["招采"],
+    "实施": ["实施"],
+    "验收": ["验收(社区需求完成交付)"],
+    "结算": ["结算"],
+}
+
 
 def _is_excluded_sheet_name(name: str) -> bool:
     return str(name or "").strip() in EXCLUDED_SHEET_NAMES
@@ -297,6 +310,10 @@ def _resolve_timeline_column(df: pd.DataFrame, chosen_col: str) -> str | None:
     chosen = str(chosen_col).strip()
     if not chosen:
         return None
+    # 优先命中别名列（保持回写到原表头结构）
+    for alias in TIMELINE_ALIAS_MAP.get(chosen, []):
+        if alias in df.columns:
+            return alias
     # 优先回写到“原表头”列（如 验收(社区需求完成交付)），保持与飞书原结构一致
     preferred = []
     for raw_name, std_name in TIMELINE_COL_MAP.items():
@@ -514,6 +531,14 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
         out["实际预计金额"] = pd.to_numeric(out["实际预计金额"], errors="coerce").fillna(0)
     if "序号" in out.columns:
         out["序号"] = pd.to_numeric(out["序号"], errors="coerce")
+    # 用别名列补齐标准时间节点列（仅用于统一展示/编辑入口）
+    for std_col, aliases in TIMELINE_ALIAS_MAP.items():
+        if std_col in out.columns:
+            continue
+        for alias in aliases:
+            if alias in out.columns:
+                out[std_col] = out[alias]
+                break
     # 时间节点列：把 Excel 序列日期统一转为 YYYY-MM-DD，修复 46023 这类“日期乱码”
     for tcol in TIMELINE_COLS:
         if tcol in out.columns:
