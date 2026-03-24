@@ -333,12 +333,13 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
                     return False
             return True
 
-        # 3) 分块读取数据：每次读取 chunk_rows 行
+        # 3) 分块读取数据：从探测到的首条数据行开始（兼容多行表头）
         rows = []
         chunk_rows = 500
         max_end = 50000  # 兜底上限：避免无限循环
 
-        start = 2
+        data_start_row = _detect_sheet_data_start_row(spreadsheet_token, sheet_id, token)
+        start = data_start_row
         while start <= max_end:
             end = min(max_end, start + chunk_rows - 1)
             range_expr = f"{sheet_id}!A{start}:{col_end}{end}"
@@ -391,8 +392,8 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
         # 业务适配：用户要求「园区=sheet名」
         if sheet_name:
             df["园区"] = sheet_name
-        # 行号标识（用于后续写回时定位；1 为表头，数据从 2 开始）
-        df[FEISHU_RECORD_ID_COL] = [str(i) for i in range(2, len(df) + 2)]
+        # 行号标识（用于后续写回时定位）
+        df[FEISHU_RECORD_ID_COL] = [str(i) for i in range(data_start_row, data_start_row + len(df))]
         return df
     except Exception as e:
         _set_last_error(f"读取 sheets 异常：{_format_http_error(e)}")
