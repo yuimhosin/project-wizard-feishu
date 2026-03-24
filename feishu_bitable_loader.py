@@ -508,32 +508,56 @@ def _get_first_sheet_id(spreadsheet_token: str, token: str) -> Optional[str]:
 def _read_sheet_values_raw(
     spreadsheet_token: str, sheet_id: str, token: str
 ) -> tuple[list[list], str]:
-    rng = _sheet_join_range(sheet_id, "A1:ZZ10000")
-    q = quote(rng, safe="")
-    last_err = ""
-    for prefix in ("sheets", "sheet"):
-        url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/values/{q}"
-        req = urllib.request.Request(
-            url,
-            method="GET",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                data = json.loads(resp.read().decode())
-            if data.get("code") == 0:
-                values = (data.get("data") or {}).get("valueRange", {}).get("values") or []
-                return values, ""
-            last_err = f"code={data.get('code')} msg={data.get('msg')}"
-        except urllib.error.HTTPError as e:
+    def _request_range(a1_range: str) -> tuple[list[list], str]:
+        q = quote(_sheet_join_range(sheet_id, a1_range), safe="")
+        last_err_inner = ""
+        for prefix in ("sheets", "sheet"):
+            url = f"{FEISHU_API_BASE}/{prefix}/v2/spreadsheets/{spreadsheet_token}/values/{q}"
+            req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"Authorization": f"Bearer {token}"},
+            )
             try:
-                raw = e.read().decode("utf-8", errors="ignore")
-            except Exception:
-                raw = ""
-            last_err = f"HTTP {e.code} {raw}"
-        except Exception as e:
-            last_err = str(e)
-    return [], last_err or "读取电子表格失败"
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode())
+                if data.get("code") == 0:
+                    values = (data.get("data") or {}).get("valueRange", {}).get("values") or []
+                    return values, ""
+                last_err_inner = f"code={data.get('code')} msg={data.get('msg')}"
+            except urllib.error.HTTPError as e:
+                try:
+                    raw = e.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    raw = ""
+                last_err_inner = f"HTTP {e.code} {raw}"
+            except Exception as e:
+                last_err_inner = str(e)
+        return [], last_err_inner or "读取电子表格失败"
+
+    # 飞书单次读取上限 10MB，按行分段拉取，规避 90221(data exceeded 10485760 bytes)
+    all_values: list[list] = []
+    start_row = 1
+    chunk_rows = 800
+    max_rows = 50000
+    last_err = ""
+    while start_row <= max_rows:
+        end_row = min(start_row + chunk_rows - 1, max_rows)
+        rows, err = _request_range(f"A{start_row}:ZZ{end_row}")
+        if err:
+            # 若当前块过大，自动缩小块大小重试；最小退到 100 行
+            if "90221" in err and chunk_rows > 100:
+                chunk_rows = max(100, chunk_rows // 2)
+                continue
+            return [], err
+        if not rows:
+            break
+        if start_row == 1:
+            all_values.extend(rows)
+        else:
+            all_values.extend(rows)
+        start_row = end_row + 1
+    return all_values, last_err
 
 
 def load_from_sheets(url_or_id: str) -> pd.DataFrame:
