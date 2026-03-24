@@ -133,6 +133,7 @@ def _ensure_feishu_secrets_in_env() -> None:
             for key in (
                 "FEISHU_APP_ID",
                 "FEISHU_APP_SECRET",
+                "FEISHU_TABLE_URL",
                 "FEISHU_BITABLE_URL",
             ):
                 if str(os.environ.get(key, "")).strip():
@@ -144,6 +145,19 @@ def _ensure_feishu_secrets_in_env() -> None:
                     pass
     except Exception:
         pass
+
+
+DEFAULT_FEISHU_TABLE_URL = (
+    "https://tkhome.feishu.cn/sheets/WHpesgmsohOVpLtdokocXotsnfe?sheet=dAFcmN"
+)
+
+
+def _default_feishu_table_url() -> str:
+    return str(
+        os.getenv("FEISHU_TABLE_URL")
+        or os.getenv("FEISHU_BITABLE_URL")
+        or DEFAULT_FEISHU_TABLE_URL
+    ).strip()
 
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
@@ -5762,17 +5776,14 @@ def main():
         else:
             bitable_url = st.text_input(
                 "飞书多维表格链接",
-                value=str(os.getenv(
-                    "FEISHU_BITABLE_URL",
-                    "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
-                )).strip(),
+                value=_default_feishu_table_url(),
                 placeholder="支持 sheets/base/wiki 链接；wiki/base 建议带 ?table=TableId",
             )
             load_all_sheets = st.checkbox("读取全部园区（较慢）", value=False, key="load_all_sheets_feishu")
 
             if st.button("🔄 从飞书加载", key="load_feishu"):
                 if not (bitable_url or "").strip():
-                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
+                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。")
                 else:
                     import re
 
