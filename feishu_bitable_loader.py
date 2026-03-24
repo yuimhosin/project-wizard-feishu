@@ -13,10 +13,20 @@ import pandas as pd
 
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
+_last_feishu_error = ""
 
 # 本地与数据库中保留的飞书记录 ID，用于更新/删除；勿在飞书「字段」中重复建同名列
 FEISHU_RECORD_ID_COL = "__feishu_record_id"
 _BATCH_SIZE = 500
+
+
+def _set_last_error(msg: str) -> None:
+    global _last_feishu_error
+    _last_feishu_error = (msg or "").strip()
+
+
+def get_last_feishu_error() -> str:
+    return _last_feishu_error
 
 
 def _get_tenant_access_token() -> Optional[str]:
@@ -24,6 +34,7 @@ def _get_tenant_access_token() -> Optional[str]:
     app_id = os.getenv("FEISHU_APP_ID", "")
     app_secret = os.getenv("FEISHU_APP_SECRET", "")
     if not app_id or not app_secret:
+        _set_last_error("未配置 FEISHU_APP_ID 或 FEISHU_APP_SECRET。")
         return None
 
     now = time.time()
@@ -46,9 +57,11 @@ def _get_tenant_access_token() -> Optional[str]:
                 expire = data.get("expire", 7200)
                 _token_cache["token"] = token
                 _token_cache["expires_at"] = now + expire
+                _set_last_error("")
                 return token
+            _set_last_error(f"获取 tenant_access_token 失败：code={data.get('code')} msg={data.get('msg')}")
     except Exception:
-        pass
+        _set_last_error("获取 tenant_access_token 异常。")
     return None
 
 
@@ -159,13 +172,16 @@ def load_from_bitable(url_or_id: str) -> pd.DataFrame:
     if is_wiki:
         app_token = _get_app_token_from_wiki_node(app_token)
         if not app_token:
+            _set_last_error("wiki 节点无法解析为多维表格 app_token。")
             return pd.DataFrame()
     elif not app_token:
+        _set_last_error("多维表格链接无法解析 app_token。")
         return pd.DataFrame()
 
     if not table_id:
         table_id = _get_first_table_id(app_token)
         if not table_id:
+            _set_last_error("未找到可用 table_id，请检查链接与权限。")
             return pd.DataFrame()
 
     all_records = []
@@ -186,6 +202,7 @@ def load_from_bitable(url_or_id: str) -> pd.DataFrame:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
                 if data.get("code") != 0:
+                    _set_last_error(f"Bitable 读取失败：code={data.get('code')} msg={data.get('msg')}")
                     return pd.DataFrame()
                 d = data.get("data", {})
                 items = d.get("items", [])
@@ -202,11 +219,13 @@ def load_from_bitable(url_or_id: str) -> pd.DataFrame:
                 if not d.get("has_more", False) or not page_token:
                     break
         except Exception:
+            _set_last_error("Bitable 读取异常，请检查网络或权限。")
             return pd.DataFrame()
 
     if not all_records:
+        _set_last_error("飞书返回 0 条数据（可能只有表头或无可读记录）。")
         return pd.DataFrame()
-
+    _set_last_error("")
     return pd.DataFrame(all_records)
 
 
@@ -528,15 +547,18 @@ def load_from_sheets(url_or_id: str) -> pd.DataFrame:
 
     parsed = _parse_sheets_url(url_or_id)
     if not parsed:
+        _set_last_error("电子表格链接解析失败，请使用 .../sheets/{token}?sheet={子表id}。")
         return pd.DataFrame()
     spreadsheet_token, sheet_id = parsed
     if not sheet_id:
         sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
     if not sheet_id:
+        _set_last_error("无法获取子表 sheet_id，请检查链接与权限。")
         return pd.DataFrame()
 
     values, err = _read_sheet_values_raw(spreadsheet_token, sheet_id, token)
     if not values:
+        _set_last_error(err or "电子表格返回空数据。")
         return pd.DataFrame()
 
     raw_header = [str(x).strip() if x is not None else "" for x in values[0]]
@@ -560,6 +582,10 @@ def load_from_sheets(url_or_id: str) -> pd.DataFrame:
             rec[col_name] = _flatten_sheet_cell(cell)
         rows_out.append(rec)
 
+    if not rows_out:
+        _set_last_error("电子表格仅有表头，无数据行。")
+        return pd.DataFrame()
+    _set_last_error("")
     return pd.DataFrame(rows_out)
 
 

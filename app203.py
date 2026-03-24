@@ -22,6 +22,7 @@ try:
     from feishu_bitable_loader import (
         load_from_feishu,
         sync_feishu_diff,
+        get_last_feishu_error,
         FEISHU_RECORD_ID_COL,
     )
     FEISHU_BITABLE_AVAILABLE = True
@@ -29,6 +30,7 @@ except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
     sync_feishu_diff = None  # type: ignore
     load_from_feishu = None  # type: ignore
+    get_last_feishu_error = None  # type: ignore
     FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 try:
@@ -5770,9 +5772,17 @@ def main():
                     with st.spinner("正在从飞书加载..."):
                         loaded = load_from_feishu(bitable_url.strip())
                     if loaded.empty:
+                        detail = ""
+                        try:
+                            if get_last_feishu_error is not None:
+                                detail = (get_last_feishu_error() or "").strip()
+                        except Exception:
+                            detail = ""
                         st.warning(
                             "未获取到数据，请检查链接和权限（应用需具备该电子表格/多维表格的读取权限）。"
                         )
+                        if detail:
+                            st.error(f"飞书返回详情：{detail}")
                     else:
                         st.session_state["feishu_bitable_url"] = bitable_url.strip()
                         os.environ["FEISHU_LAST_BITABLE_URL"] = bitable_url.strip()
