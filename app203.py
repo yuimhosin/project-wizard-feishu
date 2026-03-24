@@ -15,14 +15,20 @@ import urllib.request
 from datetime import datetime, date
 from functools import lru_cache
 from urllib.parse import quote_plus
-from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
+from data_loader import get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
-    from feishu_bitable_loader import load_from_bitable
+    from feishu_bitable_loader import (
+        load_from_bitable,
+        sync_bitable_df_diff,
+        FEISHU_RECORD_ID_COL,
+    )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
+    sync_bitable_df_diff = None  # type: ignore
+    FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 try:
     from feishu_oauth import build_authorize_url, exchange_code_for_user
@@ -66,14 +72,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 默认数据目录与默认单文件路径
-# 这里将项目根目录下的 CSV 表作为默认文件，方便打包后的 exe 直接使用
-ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = str(ROOT_DIR)
-DEFAULT_SINGLE_FILE = str(ROOT_DIR / "改良改造报表-V4.csv")
-# 内嵌默认数据（加密 .enc，随 git 提交，Streamlit Cloud 部署用）
-DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
-LEGACY_DB_ROWS_TO_REPLACE = {337}
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
 专业大类 = [
@@ -183,14 +181,72 @@ def load_from_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def save_to_db(df: pd.DataFrame):
-    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）。"""
+def _get_feishu_sync_url() -> str | None:
+    """用于写回飞书多维表格的链接：优先当前侧边栏已同步的 URL，其次环境变量。"""
+    try:
+        u = st.session_state.get("feishu_bitable_url")
+        if u and str(u).strip():
+            return str(u).strip()
+    except Exception:
+        pass
+    return (os.getenv("FEISHU_LAST_BITABLE_URL") or os.getenv("FEISHU_BITABLE_URL") or "").strip() or None
+
+
+def _remember_bitable_url_from_sidebar(bitable_url: str) -> None:
+    """每次渲染把输入框里的链接写入 session，避免未点「加载」时写回飞书因无 URL 被静默跳过。"""
+    s = (bitable_url or "").strip()
+    if not s:
+        try:
+            st.session_state.pop("feishu_bitable_url", None)
+        except Exception:
+            pass
+        return
+    try:
+        st.session_state["feishu_bitable_url"] = s
+        os.environ["FEISHU_LAST_BITABLE_URL"] = s
+    except Exception:
+        pass
+
+
+def save_to_db(df: pd.DataFrame, sync_feishu: bool = True):
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）；可选同步变更到飞书多维表格。"""
     if df is None or df.empty:
         return
+    try:
+        df_old = load_from_db()
+    except Exception:
+        df_old = pd.DataFrame()
     engine = _get_db_engine()
-    # 用事务保证 replace 的一致性
     with engine.begin() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
+    if not sync_feishu or not FEISHU_BITABLE_AVAILABLE or sync_bitable_df_diff is None:
+        return
+    url = _get_feishu_sync_url()
+    if not url:
+        try:
+            st.session_state["feishu_sync_last_warn"] = (
+                "未检测到飞书表格链接（左侧输入框需填写完整链接）。修改仅保存在本地 SQLite，未同步到飞书。"
+            )
+        except Exception:
+            pass
+        return
+    try:
+        ok, msg, df_patched = sync_bitable_df_diff(url, df_old, df)
+        if ok and df_patched is not None:
+            save_to_db(df_patched, sync_feishu=False)
+        try:
+            if not ok:
+                st.session_state["feishu_sync_last_error"] = msg
+            else:
+                st.session_state["feishu_sync_last_error"] = ""
+                st.session_state["feishu_sync_last_ok"] = msg or "已同步到飞书。"
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            st.session_state["feishu_sync_last_error"] = str(e)
+        except Exception:
+            pass
 
 
 def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -198,12 +254,12 @@ def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
     needed = [
         "序号", "园区", "所属区域", "城市", "所属业态",
         "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
-        "专业", "专业分包", "项目名称", "备注说明", "拟定金额", "上传凭证",
+        "专业", "专业分包", "项目名称", "备注说明", "实际预计金额", "上传凭证",
     ]
     out = df.copy()
     for col in needed:
         if col not in out.columns:
-            out[col] = "" if col not in ["序号", "拟定金额"] else 0
+            out[col] = "" if col not in ["序号", "实际预计金额"] else 0
     return out
 
 
@@ -238,14 +294,17 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
         out["专业分包"] = out["专业分包"].fillna(out["专业细分"])
     if "专业细分" in out.columns:
         out = out.drop(columns=["专业细分"], errors="ignore")
-    if "拟定金额" in out.columns:
-        out["拟定金额"] = pd.to_numeric(out["拟定金额"], errors="coerce").fillna(0)
+    # 兼容旧表头「拟定金额」
+    if "拟定金额" in out.columns and "实际预计金额" not in out.columns:
+        out = out.rename(columns={"拟定金额": "实际预计金额"})
+    if "实际预计金额" in out.columns:
+        out["实际预计金额"] = pd.to_numeric(out["实际预计金额"], errors="coerce").fillna(0)
     if "序号" in out.columns:
         out["序号"] = pd.to_numeric(out["序号"], errors="coerce")
     base_order = [
         "序号", "园区", "所属区域", "城市", "所属业态",
         "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
-        "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+        "专业", "专业分包", "项目名称", "备注说明", "实际预计金额",
     ]
     timeline_cols = [c for c in TIMELINE_COLS if c in out.columns]
     extra = ["上传凭证"] if "上传凭证" in out.columns else []
@@ -540,11 +599,11 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         "专业分包",
         "项目名称",
         "备注说明",
-        "拟定金额",
+        "实际预计金额",
     ]
     default_tags = st.session_state.get(
         "tag_pool_selection",
-        ["社区（园区）", "所属区域", "项目分级", "专业", "专业分包", "拟定金额"],
+        ["社区（园区）", "所属区域", "项目分级", "专业", "专业分包", "实际预计金额"],
     )
     selected_tags = st.multiselect(
         "请选择本次分析要关注的字段（至少选择一个）：",
@@ -552,9 +611,9 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         default=[t for t in default_tags if t in all_tags],
         help=(
             "示例：\n"
-            "- 只看区域对比：勾选「所属区域」「拟定金额」。\n"
-            "- 看分级与专业：勾选「项目分级」「专业」「拟定金额」。\n"
-            "- 只看社区层面的统计：勾选「社区（园区）」「拟定金额」。"
+            "- 只看区域对比：勾选「所属区域」「实际预计金额」。\n"
+            "- 看分级与专业：勾选「项目分级」「专业」「实际预计金额」。\n"
+            "- 只看社区层面的统计：勾选「社区（园区）」「实际预计金额」。"
         ),
     )
     st.session_state["tag_pool_selection"] = selected_tags
@@ -567,7 +626,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     show_region = "所属区域" in selected_tags
     show_prof_subcontract = "专业分包" in selected_tags
     show_level_stats = "项目分级" in selected_tags
-    use_amount_filter = "拟定金额" in selected_tags
+    use_amount_filter = "实际预计金额" in selected_tags
     show_business_type = "所属业态" in selected_tags
     show_category = "项目分类" in selected_tags
     show_contractor = "拟定承建组织" in selected_tags
@@ -628,21 +687,21 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             if selected_levels:
                 sub_for_opts = sub_for_opts[sub_for_opts["项目分级"].isin(selected_levels)]
 
-    if use_amount_filter and "拟定金额" in sub_for_opts.columns:
+    if use_amount_filter and "实际预计金额" in sub_for_opts.columns:
         with col_amount:
             try:
-                min_val = float(sub_for_opts["拟定金额"].min() or 0)
-                max_val = float(sub_for_opts["拟定金额"].max() or 0)
+                min_val = float(sub_for_opts["实际预计金额"].min() or 0)
+                max_val = float(sub_for_opts["实际预计金额"].max() or 0)
             except Exception:
                 min_val, max_val = 0.0, 0.0
             if max_val < min_val:
                 max_val = min_val
             if min_val == max_val:
                 amount_min, amount_max = min_val, max_val
-                st.write(f"拟定金额范围：{min_val:,.0f} 万元")
+                st.write(f"实际预计金额范围：{min_val:,.0f} 万元")
             else:
                 amount_min, amount_max = st.slider(
-                    "拟定金额范围（万元）",
+                    "实际预计金额范围（万元）",
                     min_value=float(min_val),
                     max_value=float(max_val),
                     value=(float(min_val), float(max_val)),
@@ -651,9 +710,9 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 )
 
     # 其他标签字段的多选筛选
-    if use_amount_filter and amount_min is not None and amount_max is not None and "拟定金额" in sub_for_opts.columns:
+    if use_amount_filter and amount_min is not None and amount_max is not None and "实际预计金额" in sub_for_opts.columns:
         sub_for_opts = sub_for_opts[
-            (sub_for_opts["拟定金额"] >= amount_min) & (sub_for_opts["拟定金额"] <= amount_max)
+            (sub_for_opts["实际预计金额"] >= amount_min) & (sub_for_opts["实际预计金额"] <= amount_max)
         ]
 
     if show_business_type and "项目业态" in sub_for_opts.columns:
@@ -765,9 +824,9 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         use_amount_filter
         and amount_min is not None
         and amount_max is not None
-        and "拟定金额" in sub.columns
+        and "实际预计金额" in sub.columns
     ):
-        sub = sub[(sub["拟定金额"] >= amount_min) & (sub["拟定金额"] <= amount_max)]
+        sub = sub[(sub["实际预计金额"] >= amount_min) & (sub["实际预计金额"] <= amount_max)]
 
     if selected_business_types and "项目业态" in sub.columns:
         sub = sub[sub["项目业态"].isin(selected_business_types)]
@@ -790,7 +849,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     # 1. 按数量和费用统计项目，计算与预算差值（只要选择了任意标签就展示整体概览）
     st.markdown("### 📊 项目数量与费用统计")
     total_count = len(sub)
-    total_amount = sub["拟定金额"].sum() if "拟定金额" in sub.columns else 0
+    total_amount = sub["实际预计金额"].sum() if "实际预计金额" in sub.columns else 0
     
     # 尝试从原始数据中提取预算系统合计（如果有汇总行）
     budget_total = 0
@@ -800,7 +859,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         if not budget_rows.empty:
             for _, row in budget_rows.iterrows():
                 if "预算系统合计" in str(row.values):
-                    for col in ["拟定金额", "金额", "预算"]:
+                    for col in ["实际预计金额", "金额", "预算"]:
                         if col in row.index:
                             try:
                                 val = row[col]
@@ -816,7 +875,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         if budget_total == 0 and "园区" in df.columns:
             budget_rows = df[df["园区"].astype(str).str.contains("预算系统合计", na=False)]
             if not budget_rows.empty:
-                for col in ["拟定金额", "金额", "预算"]:
+                for col in ["实际预计金额", "金额", "预算"]:
                     if col in budget_rows.columns:
                         try:
                             val = budget_rows.iloc[0][col]
@@ -843,7 +902,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         st.markdown("#### 按园区统计")
         park_stats = sub.groupby("园区", dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
+            金额合计=("实际预计金额", "sum"),
         ).reset_index()
         park_stats["金额合计"] = park_stats["金额合计"].round(2)
         st.dataframe(park_stats, use_container_width=True, hide_index=True)
@@ -853,7 +912,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         st.markdown("#### 按所属区域统计")
         region_stats = sub.groupby("所属区域", dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
+            金额合计=("实际预计金额", "sum"),
             园区数=("园区", "nunique"),
         ).reset_index()
         region_stats = region_stats[region_stats["所属区域"] != "其他"].sort_values("项目数", ascending=False)
@@ -866,7 +925,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             region_df = sub[sub["所属区域"] == region]
             parks_in_region = region_df.groupby("园区", dropna=False).agg(
                 项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
+                金额合计=("实际预计金额", "sum"),
             ).reset_index().sort_values("项目数", ascending=False)
             parks_in_region["金额合计"] = parks_in_region["金额合计"].round(2)
             
@@ -881,7 +940,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         st.markdown("### 📦 按专业分包统计")
         by_prof_subcontract = sub.groupby(prof_subcontract_col, dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
+            金额合计=("实际预计金额", "sum"),
         ).reset_index().sort_values("金额合计", ascending=False)
         by_prof_subcontract["金额合计"] = by_prof_subcontract["金额合计"].round(2)
         by_prof_subcontract["项目数占比"] = (by_prof_subcontract["项目数"] / by_prof_subcontract["项目数"].sum() * 100).round(2)
@@ -924,7 +983,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             st.markdown("#### 专业与专业分包交叉统计")
             cross_stats = sub.groupby(["专业", prof_subcontract_col], dropna=False).agg(
                 项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
+                金额合计=("实际预计金额", "sum"),
             ).reset_index().sort_values("金额合计", ascending=False)
             # 过滤掉"其它系统"分类
             cross_stats = cross_stats[~cross_stats["专业"].isin(["其它系统", "其他系统"])]
@@ -946,7 +1005,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         
         level_stats = sub_copy.groupby("项目类别", dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
+            金额合计=("实际预计金额", "sum"),
         ).reset_index()
         
         total_projects = level_stats["项目数"].sum()
@@ -1049,10 +1108,10 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("已实施项目数", len(已实施项目))
-            st.metric("已实施金额（万元）", f"{已实施项目['拟定金额'].sum():,.0f}" if len(已实施项目) > 0 else "0")
+            st.metric("已实施金额（万元）", f"{已实施项目['实际预计金额'].sum():,.0f}" if len(已实施项目) > 0 else "0")
         with col2:
             st.metric("未实施项目数", len(未实施项目))
-            st.metric("未实施金额（万元）", f"{未实施项目['拟定金额'].sum():,.0f}" if len(未实施项目) > 0 else "0")
+            st.metric("未实施金额（万元）", f"{未实施项目['实际预计金额'].sum():,.0f}" if len(未实施项目) > 0 else "0")
         with col3:
             total_impl = len(sub_copy)
             if total_impl > 0:
@@ -1068,8 +1127,8 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             park_df = sub_copy[sub_copy["园区"] == park]
             总项目数 = len(park_df)
             已实施数 = park_df["已实施"].sum()
-            总金额 = park_df["拟定金额"].sum()
-            已实施金额 = park_df[park_df["已实施"]]["拟定金额"].sum()
+            总金额 = park_df["实际预计金额"].sum()
+            已实施金额 = park_df[park_df["已实施"]]["实际预计金额"].sum()
             park_impl_list.append({
                 "园区": park,
                 "总项目数": 总项目数,
@@ -1110,7 +1169,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             一级项目 = pd.concat([一级项目_str, 一级项目_num]).drop_duplicates()
         else:
             一级项目 = pd.DataFrame()
-        一级项目金额 = 一级项目["拟定金额"].sum() if len(一级项目) > 0 else 0
+        一级项目金额 = 一级项目["实际预计金额"].sum() if len(一级项目) > 0 else 0
         
         # 总部项目金额（总部重点关注项目列为"是"的项目）
         if "总部重点关注项目" in park_df.columns:
@@ -1119,15 +1178,15 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             ]
         else:
             总部项目 = pd.DataFrame()
-        总部项目金额 = 总部项目["拟定金额"].sum() if len(总部项目) > 0 else 0
+        总部项目金额 = 总部项目["实际预计金额"].sum() if len(总部项目) > 0 else 0
         
         # 重大改造项目（单个200万以上）
-        重大改造项目 = park_df[park_df["拟定金额"] >= 200]
-        重大改造项目金额 = 重大改造项目["拟定金额"].sum() if len(重大改造项目) > 0 else 0
+        重大改造项目 = park_df[park_df["实际预计金额"] >= 200]
+        重大改造项目金额 = 重大改造项目["实际预计金额"].sum() if len(重大改造项目) > 0 else 0
         重大改造项目数 = len(重大改造项目)
         
         # 总金额
-        总金额 = park_df["拟定金额"].sum()
+        总金额 = park_df["实际预计金额"].sum()
         
         park_analysis.append({
             "园区": park,
@@ -1644,10 +1703,10 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         with col1:
             st.markdown("**已确定项目（有立项日期）**")
             st.metric("项目数", len(确定项目))
-            st.metric("金额合计（万元）", f"{确定项目['拟定金额'].sum():,.0f}")
+            st.metric("金额合计（万元）", f"{确定项目['实际预计金额'].sum():,.0f}")
             if not 确定项目.empty:
                 # 准备显示用的数据框
-                display_df = 确定项目[["园区", "序号", "项目名称", "拟定金额"]].copy()
+                display_df = 确定项目[["园区", "序号", "项目名称", "实际预计金额"]].copy()
                 # 添加格式化后的立项日期
                 if "_立项日期_parsed" in 确定项目.columns:
                     display_df["立项日期"] = 确定项目["_立项日期_parsed"].dt.strftime("%Y-%m-%d")
@@ -1662,10 +1721,10 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         with col2:
             st.markdown("**未确定项目（无立项日期）**")
             st.metric("项目数", len(未确定项目))
-            st.metric("金额合计（万元）", f"{未确定项目['拟定金额'].sum():,.0f}")
+            st.metric("金额合计（万元）", f"{未确定项目['实际预计金额'].sum():,.0f}")
             if not 未确定项目.empty:
                 st.dataframe(
-                    未确定项目[["园区", "序号", "项目名称", "拟定金额"]].head(20),
+                    未确定项目[["园区", "序号", "项目名称", "实际预计金额"]].head(20),
                     use_container_width=True,
                     hide_index=True
                 )
@@ -1694,7 +1753,7 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         if not 有月份的项目.empty:
             monthly_stats = 有月份的项目.groupby("立项月份", dropna=False).agg(
                 立项项目数=("序号", "count"),
-                立项金额=("拟定金额", "sum"),
+                立项金额=("实际预计金额", "sum"),
             ).reset_index().sort_values("立项月份")
             monthly_stats["立项金额"] = monthly_stats["立项金额"].round(2)
             
@@ -1792,7 +1851,7 @@ def _build_城市_园区明细(df: pd.DataFrame) -> dict:
         return {}
     by_city_park = sub.groupby(["城市", "园区"], dropna=False).agg(
         项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
+        金额合计=("实际预计金额", "sum"),
     ).reset_index()
     out = {}
     for city in by_city_park["城市"].unique():
@@ -1834,7 +1893,7 @@ def _render_中国地图(df: pd.DataFrame, city_tooltip_data: dict):
     
     by_city = df.groupby("城市", dropna=False).agg(
         项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
+        金额合计=("实际预计金额", "sum"),
     ).reset_index()
     
     data = []
@@ -2042,7 +2101,7 @@ def _render_图表_简易(sub: pd.DataFrame):
     by_park = sub.groupby("园区", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False).head(20)
     if not by_park.empty:
         st.bar_chart(by_park.set_index("园区")["项目数"])
-    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
+    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("实际预计金额", "sum")).reset_index().sort_values("金额", ascending=False)
     if not by_prof_m.empty:
         st.bar_chart(by_prof_m.set_index("专业")["金额"])
 
@@ -2595,7 +2654,11 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
         }}
         
         function getValue(row, col) {{
-            return row[col] !== null && row[col] !== undefined ? row[col] : '';
+            let v = row[col];
+            if (v !== null && v !== undefined && v !== '') return v;
+            if (col === '实际预计金额' && row['拟定金额'] !== null && row['拟定金额'] !== undefined && row['拟定金额'] !== '')
+                return row['拟定金额'];
+            return '';
         }}
         
         function isValidNumber(val) {{
@@ -2676,7 +2739,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
             
             // 计算统计数据
             const totalCount = validData.length;
-            const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0);
+            const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0);
             
             // 尝试提取预算系统合计（从原始数据中查找汇总行）
             let budgetTotal = 0;
@@ -2684,7 +2747,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
             for (let d of allDataForBudget) {{
                 const seq = String(d.序号 || '').trim();
                 if (seq === '预算系统合计' || seq === '合计') {{
-                    const amt = parseFloat(d.拟定金额) || parseFloat(d.金额) || parseFloat(d.预算) || 0;
+                    const amt = parseFloat(d.实际预计金额) || parseFloat(d.金额) || parseFloat(d.预算) || 0;
                     if (amt > 0) {{
                         budgetTotal = amt;
                         break;
@@ -2701,7 +2764,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     parkStats[park] = {{count: 0, amount: 0}};
                 }}
                 parkStats[park].count++;
-                parkStats[park].amount += parseFloat(d.拟定金额) || 0;
+                parkStats[park].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按所属区域统计
@@ -2713,7 +2776,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         regionStats[region] = {{count: 0, amount: 0, parks: new Set()}};
                     }}
                     regionStats[region].count++;
-                    regionStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    regionStats[region].amount += parseFloat(d.实际预计金额) || 0;
                     if (d.园区) regionStats[region].parks.add(d.园区);
                 }}
             }});
@@ -2726,7 +2789,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     levelStats[level] = {{count: 0, amount: 0}};
                 }}
                 levelStats[level].count++;
-                levelStats[level].amount += parseFloat(d.拟定金额) || 0;
+                levelStats[level].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 映射：一级->一类，二级->二类，三级->三类
@@ -2771,10 +2834,10 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         parkImplStats[park] = {{total: 0, implemented: 0, amount: 0, implAmount: 0}};
                     }}
                     parkImplStats[park].total++;
-                    parkImplStats[park].amount += parseFloat(d.拟定金额) || 0;
+                    parkImplStats[park].amount += parseFloat(d.实际预计金额) || 0;
                     if (isImplemented) {{
                         parkImplStats[park].implemented++;
-                        parkImplStats[park].implAmount += parseFloat(d.拟定金额) || 0;
+                        parkImplStats[park].implAmount += parseFloat(d.实际预计金额) || 0;
                     }}
                 }});
             }}
@@ -2832,7 +2895,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 monthlyStats[month] = {{count: 0, amount: 0}};
                             }}
                             monthlyStats[month].count++;
-                            monthlyStats[month].amount += parseFloat(d.拟定金额) || 0;
+                            monthlyStats[month].amount += parseFloat(d.实际预计金额) || 0;
                         }}
                     }} else {{
                         未确定项目.push(d);
@@ -2860,7 +2923,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         majorCount: 0
                     }};
                 }}
-                const amount = parseFloat(d.拟定金额) || 0;
+                const amount = parseFloat(d.实际预计金额) || 0;
                 parkAnalysis[park].total += amount;
                 
                 // 一级项目识别：支持多种格式（一级、1级、一级项目、1等）
@@ -2962,7 +3025,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 parkStatsInRegion[park] = {{count: 0, amount: 0}};
                             }}
                             parkStatsInRegion[park].count++;
-                            parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                            parkStatsInRegion[park].amount += parseFloat(d.实际预计金额) || 0;
                         }});
                         return `
                             <div class="expander">
@@ -3043,10 +3106,10 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                             profSubcontractStats[val] = {{count: 0, amount: 0}};
                                         }}
                                         profSubcontractStats[val].count++;
-                                        profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                                        profSubcontractStats[val].amount += parseFloat(d.实际预计金额) || 0;
                                     }});
                                     const totalCount = validData.length;
-                                    const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0);
+                                    const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0);
                                     return Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount).map(key => {{
                                         const stats = profSubcontractStats[key];
                                         const countPercent = totalCount > 0 ? (stats.count / totalCount * 100).toFixed(2) : 0;
@@ -3093,7 +3156,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                             crossStats[key] = {{prof: prof, subcontract: subcontract, count: 0, amount: 0}};
                                         }}
                                         crossStats[key].count++;
-                                        crossStats[key].amount += parseFloat(d.拟定金额) || 0;
+                                        crossStats[key].amount += parseFloat(d.实际预计金额) || 0;
                                     }});
                                     return Object.keys(crossStats).sort((a, b) => crossStats[b].amount - crossStats[a].amount).map(key => {{
                                         const stats = crossStats[key];
@@ -3121,7 +3184,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         </div>
                         <div class="metric">
                             <div class="metric-label">已实施金额（万元）</div>
-                            <div class="metric-value">${{formatCurrency(已实施项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                            <div class="metric-value">${{formatCurrency(已实施项目.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0))}}</div>
                         </div>
                         <div class="metric">
                             <div class="metric-label">未实施项目数</div>
@@ -3129,7 +3192,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         </div>
                         <div class="metric">
                             <div class="metric-label">未实施金额（万元）</div>
-                            <div class="metric-value">${{formatCurrency(未实施项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                            <div class="metric-value">${{formatCurrency(未实施项目.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0))}}</div>
                         </div>
                         <div class="metric">
                             <div class="metric-label">实施率</div>
@@ -3256,7 +3319,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         </div>
                         <div class="metric">
                             <div class="metric-label">已确定金额合计（万元）</div>
-                            <div class="metric-value">${{formatCurrency(确定项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                            <div class="metric-value">${{formatCurrency(确定项目.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0))}}</div>
                         </div>
                         <div class="metric">
                             <div class="metric-label">未确定项目数（无立项日期）</div>
@@ -3264,7 +3327,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         </div>
                         <div class="metric">
                             <div class="metric-label">未确定金额合计（万元）</div>
-                            <div class="metric-value">${{formatCurrency(未确定项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                            <div class="metric-value">${{formatCurrency(未确定项目.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0))}}</div>
                         </div>
                     </div>
                     
@@ -3643,7 +3706,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                             profSubcontractStats[val] = {{count: 0, amount: 0}};
                         }}
                         profSubcontractStats[val].count++;
-                        profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                        profSubcontractStats[val].amount += parseFloat(d.实际预计金额) || 0;
                     }});
                     
                     const profSubcontractLabels = Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount);
@@ -3699,7 +3762,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     profStats[prof] = {{count: 0, amount: 0}};
                 }}
                 profStats[prof].count++;
-                profStats[prof].amount += parseFloat(d.拟定金额) || 0;
+                profStats[prof].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按项目分级统计金额
@@ -3709,7 +3772,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                 if (!levelAmountStats[level]) {{
                     levelAmountStats[level] = 0;
                 }}
-                levelAmountStats[level] += parseFloat(d.拟定金额) || 0;
+                levelAmountStats[level] += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按园区统计金额
@@ -3719,7 +3782,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                 if (!parkAmountStats[park]) {{
                     parkAmountStats[park] = 0;
                 }}
-                parkAmountStats[park] += parseFloat(d.拟定金额) || 0;
+                parkAmountStats[park] += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按城市统计金额
@@ -3730,7 +3793,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     if (!cityAmountStats[city]) {{
                         cityAmountStats[city] = 0;
                     }}
-                    cityAmountStats[city] += parseFloat(d.拟定金额) || 0;
+                    cityAmountStats[city] += parseFloat(d.实际预计金额) || 0;
                 }}
             }});
             
@@ -3742,7 +3805,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     if (!regionAmountStats[region]) {{
                         regionAmountStats[region] = 0;
                     }}
-                    regionAmountStats[region] += parseFloat(d.拟定金额) || 0;
+                    regionAmountStats[region] += parseFloat(d.实际预计金额) || 0;
                 }}
             }});
             
@@ -3757,7 +3820,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         profSubcontractStats[val] = {{count: 0, amount: 0}};
                     }}
                     profSubcontractStats[val].count++;
-                    profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                    profSubcontractStats[val].amount += parseFloat(d.实际预计金额) || 0;
                 }});
             }}
             
@@ -3770,7 +3833,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         regionDetailedStats[region] = {{count: 0, amount: 0, parks: new Set()}};
                     }}
                     regionDetailedStats[region].count++;
-                    regionDetailedStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    regionDetailedStats[region].amount += parseFloat(d.实际预计金额) || 0;
                     if (d.园区) regionDetailedStats[region].parks.add(d.园区);
                 }}
             }});
@@ -3786,7 +3849,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         parkStatsInRegion[park] = {{count: 0, amount: 0}};
                     }}
                     parkStatsInRegion[park].count++;
-                    parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                    parkStatsInRegion[park].amount += parseFloat(d.实际预计金额) || 0;
                 }});
                 regionParkDetails[region] = parkStatsInRegion;
             }});
@@ -4092,7 +4155,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         }};
                     }}
                     regionStats[region].count++;
-                    regionStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    regionStats[region].amount += parseFloat(d.实际预计金额) || 0;
                     if (d.园区) regionStats[region].parks.add(d.园区);
                     if (d.城市) regionStats[region].cities.add(d.城市);
                 }}
@@ -4180,7 +4243,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 parkStatsInRegion[park] = {{count: 0, amount: 0}};
                             }}
                             parkStatsInRegion[park].count++;
-                            parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                            parkStatsInRegion[park].amount += parseFloat(d.实际预计金额) || 0;
                         }});
                         
                         // 按专业统计（过滤掉"其它系统"）
@@ -4193,7 +4256,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 profStatsInRegion[prof] = {{count: 0, amount: 0}};
                             }}
                             profStatsInRegion[prof].count++;
-                            profStatsInRegion[prof].amount += parseFloat(d.拟定金额) || 0;
+                            profStatsInRegion[prof].amount += parseFloat(d.实际预计金额) || 0;
                         }});
                         
                         // 按城市统计
@@ -4204,7 +4267,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 cityStatsInRegion[city] = {{count: 0, amount: 0, parks: new Set()}};
                             }}
                             cityStatsInRegion[city].count++;
-                            cityStatsInRegion[city].amount += parseFloat(d.拟定金额) || 0;
+                            cityStatsInRegion[city].amount += parseFloat(d.实际预计金额) || 0;
                             if (d.园区) cityStatsInRegion[city].parks.add(d.园区);
                         }});
                         
@@ -4216,7 +4279,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                 levelStatsInRegion[level] = {{count: 0, amount: 0}};
                             }}
                             levelStatsInRegion[level].count++;
-                            levelStatsInRegion[level].amount += parseFloat(d.拟定金额) || 0;
+                            levelStatsInRegion[level].amount += parseFloat(d.实际预计金额) || 0;
                         }});
                         
                         return `
@@ -4322,7 +4385,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                     <div class="data-table-container">
                                         <table>
                                             <thead>
-                                                <tr><th>园区</th><th>城市</th><th>序号</th><th>项目分级</th>${{regionData[0] && regionData[0].项目分类 ? '<th>项目分类</th>' : ''}}<th>专业</th><th>项目名称</th><th>拟定金额</th></tr>
+                                                <tr><th>园区</th><th>城市</th><th>序号</th><th>项目分级</th>${{regionData[0] && regionData[0].项目分类 ? '<th>项目分类</th>' : ''}}<th>专业</th><th>项目名称</th><th>实际预计金额</th></tr>
                                             </thead>
                                             <tbody>
                                                 ${{regionData.slice(0, 20).map(d => `
@@ -4334,7 +4397,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                                         ${{d.项目分类 ? `<td>${{getValue(d, '项目分类')}}</td>` : ''}}
                                                         <td>${{getValue(d, '专业')}}</td>
                                                         <td>${{getValue(d, '项目名称')}}</td>
-                                                        <td>${{formatCurrency(getValue(d, '拟定金额'))}}</td>
+                                                        <td>${{formatCurrency(getValue(d, '实际预计金额'))}}</td>
                                                     </tr>
                                                 `).join('')}}
                                             </tbody>
@@ -4439,7 +4502,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     levelStats[level] = {{count: 0, amount: 0}};
                 }}
                 levelStats[level].count++;
-                levelStats[level].amount += parseFloat(d.拟定金额) || 0;
+                levelStats[level].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按专业统计（过滤掉"其它系统"）
@@ -4452,7 +4515,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     profStats[prof] = {{count: 0, amount: 0}};
                 }}
                 profStats[prof].count++;
-                profStats[prof].amount += parseFloat(d.拟定金额) || 0;
+                profStats[prof].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按园区统计
@@ -4463,7 +4526,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     parkStats[park] = {{count: 0, amount: 0}};
                 }}
                 parkStats[park].count++;
-                parkStats[park].amount += parseFloat(d.拟定金额) || 0;
+                parkStats[park].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 按专业分包统计（如果存在）
@@ -4477,7 +4540,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         profSubcontractStats[val] = {{count: 0, amount: 0}};
                     }}
                     profSubcontractStats[val].count++;
-                    profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                    profSubcontractStats[val].amount += parseFloat(d.实际预计金额) || 0;
                 }});
             }}
             
@@ -4605,7 +4668,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                     <th>专业</th>
                                     ${{hasProfSubcontract ? '<th>专业分包</th>' : ''}}
                                     <th>项目名称</th>
-                                    <th>拟定金额</th>
+                                    <th>实际预计金额</th>
                                     ${{validData[0] && validData[0].拟定承建组织 ? '<th>拟定承建组织</th>' : ''}}
                                     ${{validData[0] && validData[0].需求立项 ? '<th>需求立项</th>' : ''}}
                                     ${{validData[0] && (validData[0].验收 || validData[0]['验收(社区需求完成交付)']) ? '<th>验收</th>' : ''}}
@@ -4623,7 +4686,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                         <td>${{getValue(d, '专业')}}</td>
                                         ${{hasProfSubcontract ? `<td>${{profSubcontractVal || '未分类'}}</td>` : ''}}
                                         <td>${{getValue(d, '项目名称')}}</td>
-                                        <td>${{formatCurrency(getValue(d, '拟定金额'))}}</td>
+                                        <td>${{formatCurrency(getValue(d, '实际预计金额'))}}</td>
                                         ${{d.拟定承建组织 ? `<td>${{getValue(d, '拟定承建组织')}}</td>` : ''}}
                                         ${{d.需求立项 ? `<td>${{getValue(d, '需求立项')}}</td>` : ''}}
                                         ${{(d.验收 || d['验收(社区需求完成交付)']) ? `<td>${{getValue(d, '验收(社区需求完成交付)') || getValue(d, '验收')}}</td>` : ''}}
@@ -4690,7 +4753,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     stableParkStats[park] = {{count: 0, amount: 0}};
                 }}
                 stableParkStats[park].count++;
-                stableParkStats[park].amount += parseFloat(d.拟定金额) || 0;
+                stableParkStats[park].amount += parseFloat(d.实际预计金额) || 0;
             }});
             
             // 查找验收列和实施列
@@ -4711,7 +4774,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                     园区: d.园区 || '',
                     序号: d.序号 || '',
                     项目名称: d.项目名称 || '',
-                    拟定金额: parseFloat(d.拟定金额) || 0,
+                    实际预计金额: parseFloat(d.实际预计金额) || 0,
                     拟定承建组织: d.拟定承建组织 || '',
                     实施时间: implCol ? (d[implCol] || '') : '',
                     验收时间: acceptCol ? (d[acceptCol] || '') : ''
@@ -4750,7 +4813,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                         </div>
                         <div class="metric">
                             <div class="metric-label">稳定需求金额合计（万元）</div>
-                            <div class="metric-value">${{formatCurrency(stableData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                            <div class="metric-value">${{formatCurrency(stableData.reduce((sum, d) => sum + (parseFloat(d.实际预计金额) || 0), 0))}}</div>
                         </div>
                     </div>
                     
@@ -4779,7 +4842,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                     <th>园区</th>
                                     <th>序号</th>
                                     <th>项目名称</th>
-                                    <th>拟定金额（万元）</th>
+                                    <th>实际预计金额（万元）</th>
                                     <th>拟定承建组织</th>
                                     <th>实施时间</th>
                                     <th>验收时间</th>
@@ -4791,7 +4854,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                         <td>${{d.园区}}</td>
                                         <td>${{d.序号}}</td>
                                         <td>${{d.项目名称}}</td>
-                                        <td>${{formatCurrency(d.拟定金额)}}</td>
+                                        <td>${{formatCurrency(d.实际预计金额)}}</td>
                                         <td>${{d.拟定承建组织}}</td>
                                         <td>${{d.实施时间}}</td>
                                         <td>${{d.验收时间}}</td>
@@ -4810,7 +4873,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                     <th>园区</th>
                                     <th>序号</th>
                                     <th>项目名称</th>
-                                    <th>拟定金额（万元）</th>
+                                    <th>实际预计金额（万元）</th>
                                     <th>拟定承建组织</th>
                                     <th>实施时间</th>
                                     <th>验收时间</th>
@@ -4822,7 +4885,7 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
                                         <td>${{d.园区}}</td>
                                         <td>${{d.序号}}</td>
                                         <td>${{d.项目名称}}</td>
-                                        <td>${{formatCurrency(d.拟定金额)}}</td>
+                                        <td>${{formatCurrency(d.实际预计金额)}}</td>
                                         <td>${{d.拟定承建组织}}</td>
                                         <td>${{d.实施时间}}</td>
                                         <td>${{d.验收时间}}</td>
@@ -5030,7 +5093,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
         st.markdown("#### 各区域项目统计")
         by_region = sub.groupby("所属区域", dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
+            金额合计=("实际预计金额", "sum"),
             园区数=("园区", "nunique"),
         ).reset_index()
         by_region = by_region[by_region["所属区域"] != "其他"].sort_values("项目数", ascending=False)
@@ -5054,7 +5117,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
             region_df = sub[sub["所属区域"] == region]
             parks_in_region = region_df.groupby("园区", dropna=False).agg(
                 项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
+                金额合计=("实际预计金额", "sum"),
             ).reset_index().sort_values("项目数", ascending=False)
             parks_in_region["金额合计"] = parks_in_region["金额合计"].round(2)
             
@@ -5090,7 +5153,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
         st.markdown("**按项目分级 · 金额占比**")
         by_level = sub.groupby("项目分级", dropna=False).agg(
             项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum")
+            金额合计=("实际预计金额", "sum")
         ).reset_index().sort_values("金额合计", ascending=False)
         if not by_level.empty:
             colors = (CHART_COLORS_PIE * (1 + len(by_level) // len(CHART_COLORS_PIE)))[: len(by_level)]
@@ -5116,7 +5179,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
     c3, c4 = st.columns(2)
     with c3:
         st.markdown("**按园区 · 金额（万元）**")
-        by_park = sub.groupby("园区", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
+        by_park = sub.groupby("园区", dropna=False).agg(金额合计=("实际预计金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
         if not by_park.empty:
             by_park["金额合计"] = by_park["金额合计"].round(2)
             fig = px.bar(
@@ -5128,7 +5191,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     with c4:
         st.markdown("**按城市 · 金额（万元）**")
-        by_city = sub.groupby("城市", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index()
+        by_city = sub.groupby("城市", dropna=False).agg(金额合计=("实际预计金额", "sum")).reset_index()
         by_city = by_city[by_city["城市"] != "其他"].sort_values("金额合计", ascending=False)
         if not by_city.empty:
             by_city["金额合计"] = by_city["金额合计"].round(2)
@@ -5141,7 +5204,7 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("**按专业 · 金额合计（万元）**")
-    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
+    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("实际预计金额", "sum")).reset_index().sort_values("金额", ascending=False)
     # 过滤掉"其它系统"分类
     by_prof_m = by_prof_m[~by_prof_m["专业"].isin(["其它系统", "其他系统"])]
     if not by_prof_m.empty:
@@ -5173,7 +5236,7 @@ def _render_project_wizard(df: pd.DataFrame):
         parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
 
         if not parks_list:
-            st.info("未发现任何园区数据，请先上传/导入数据。")
+            st.info("未发现任何园区数据，请先从飞书加载数据。")
             return
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
@@ -5228,7 +5291,7 @@ def _render_project_wizard(df: pd.DataFrame):
         # 选中项目详情展示（不再显示园区列表）
         st.markdown("---")
         st.markdown("### 已选择项目详情")
-        summary_cols = [c for c in ["序号", "园区", "项目名称", "项目分级", "项目分类", "专业", "专业分包", "拟定金额"] if c in df_all.columns]
+        summary_cols = [c for c in ["序号", "园区", "项目名称", "项目分级", "项目分类", "专业", "专业分包", "实际预计金额"] if c in df_all.columns]
         if summary_cols:
             st.dataframe(pd.DataFrame([target_row[summary_cols].to_dict()]), use_container_width=True, hide_index=True)
         with st.expander("查看全部字段详情（含日期）", expanded=False):
@@ -5340,14 +5403,14 @@ def _render_project_wizard(df: pd.DataFrame):
                 分包_opts = _get_dropdown_options(df_all, "专业分包") if "专业分包" in df_all.columns else []
 
                 # 平铺展示所有可修改项目信息（除日期列，且园区/区域/城市不可改）
-                readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
+                readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证", FEISHU_RECORD_ID_COL}
                 editable_cols = [c for c in df_all.columns if c not in set(TIMELINE_COLS)]
                 editable_cols = [str(c).strip() for c in editable_cols if str(c).strip() and str(c).strip().lower() not in {"nan", "none", "null"}]
-                editable_cols = [c for c in editable_cols if c not in readonly_cols]
+                editable_cols = [c for c in editable_cols if c not in readonly_cols and not str(c).startswith("__")]
 
                 preferred_order = [
                     "所属业态", "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
-                    "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+                    "专业", "专业分包", "项目名称", "备注说明", "实际预计金额",
                 ]
                 editable_cols = [c for c in preferred_order if c in editable_cols] + [c for c in editable_cols if c not in preferred_order]
 
@@ -5379,7 +5442,7 @@ def _render_project_wizard(df: pd.DataFrame):
                         elif col == "专业分包" and 分包_opts:
                             v = str(current_val or "")
                             updates[col] = st.selectbox(col, options=[""] + 分包_opts, index=(分包_opts.index(v) + 1) if v in 分包_opts else 0, key=f"edit_info_{row_id}_{col}")
-                        elif col == "拟定金额":
+                        elif col == "实际预计金额":
                             try:
                                 updates[col] = st.number_input(col, min_value=0.0, value=float(current_val or 0.0), step=1.0, key=f"edit_info_{row_id}_{col}")
                             except Exception:
@@ -5392,9 +5455,9 @@ def _render_project_wizard(df: pd.DataFrame):
                 save_info_clicked = st.form_submit_button("💾 保存项目信息更改")
 
                 if save_info_clicked:
-                    if "拟定金额" in updates:
-                        if float(updates.get("拟定金额") or 0) <= 0:
-                            st.error("拟定金额需大于 0。")
+                    if "实际预计金额" in updates:
+                        if float(updates.get("实际预计金额") or 0) <= 0:
+                            st.error("实际预计金额需大于 0。")
                             return
 
                     df_new = df_all.copy()
@@ -5436,7 +5499,7 @@ def _render_project_wizard(df: pd.DataFrame):
     st.markdown("### 新增项目")
     df_all = _ensure_project_columns(df_all)
     next_seq = _get_next_序号(df_all)
-    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称", "拟定金额"]
+    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称", "实际预计金额"]
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
@@ -5482,7 +5545,7 @@ def _render_project_wizard(df: pd.DataFrame):
 
         项目名称 = st.text_input("项目名称*")
         备注说明 = st.text_area("备注说明（选填）")
-        拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=0.0, step=1.0)
+        实际预计金额 = st.number_input("实际预计金额（万元）*", min_value=0.0, value=0.0, step=1.0)
 
         st.markdown("**项目节点日期**（日期全列出，可统一填写）")
         timeline_values = {}
@@ -5532,13 +5595,13 @@ def _render_project_wizard(df: pd.DataFrame):
             "专业分包": 专业分包,
             "项目名称": 项目名称,
             "备注说明": 备注说明,
-            "拟定金额": 拟定金额,
+            "实际预计金额": 实际预计金额,
         }
-        missing = [k for k in required_fields if k != "拟定金额" and not str(form_dict.get(k, "")).strip()]
-        if "拟定金额" in required_fields:
-            amt = float(form_dict.get("拟定金额") or 0)
+        missing = [k for k in required_fields if k != "实际预计金额" and not str(form_dict.get(k, "")).strip()]
+        if "实际预计金额" in required_fields:
+            amt = float(form_dict.get("实际预计金额") or 0)
             if amt <= 0:
-                missing.append("拟定金额（需大于 0）")
+                missing.append("实际预计金额（需大于 0）")
         if missing:
             st.error(f"以下字段为必填：{', '.join(missing)}")
             return
@@ -5616,6 +5679,14 @@ def main():
 
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
+    warn_msg = st.session_state.pop("feishu_sync_last_warn", None)
+    if warn_msg:
+        st.warning(warn_msg)
+    if st.session_state.get("feishu_sync_last_error"):
+        st.error(f"飞书写回失败：{st.session_state['feishu_sync_last_error']}")
+    ok_msg = st.session_state.pop("feishu_sync_last_ok", None)
+    if ok_msg:
+        st.success(ok_msg)
 
     # 侧边栏：用户信息 + 数据源
     with st.sidebar:
@@ -5627,167 +5698,56 @@ def main():
                 del st.session_state["feishu_user"]
                 st.rerun()
         st.header("数据源")
-        source_options = ["数据库（团队共享）", "飞书多维表格", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"]
-        source = st.radio("数据来源", source_options, index=0)
-        df_db = load_from_db()
-        df = pd.DataFrame()
+        st.caption(
+            "数据来源仅支持飞书多维表格。加载后会在本机/服务器写入 SQLite 作为缓存，便于多人共用与快速打开。"
+            "在向导里保存修改时，会同时尝试写回飞书表格（需左侧已填写链接且应用具备写权限）；"
+            "若写回失败会页面提示，此时数据仍保存在本地缓存中。"
+        )
 
-        if source == "飞书多维表格":
-            if not FEISHU_BITABLE_AVAILABLE:
-                st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
-            elif not os.getenv("FEISHU_APP_ID") or not os.getenv("FEISHU_APP_SECRET"):
-                st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
-            else:
-                bitable_url = st.text_input(
-                    "飞书多维表格链接",
-                    value=os.getenv(
-                        "FEISHU_BITABLE_URL",
-                        "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
-                    ),
-                    placeholder="https://xxx.feishu.cn/base/AppToken 或 wiki 链接含 ?table=TableId",
-                )
-                if bitable_url.strip():
-                    if st.button("🔄 从飞书加载", key="load_feishu"):
-                        with st.spinner("正在从飞书加载..."):
-                            loaded = load_from_bitable(bitable_url.strip())
-                        if loaded.empty:
-                            st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
-                        else:
-                            st.session_state["df_from_feishu"] = loaded
-                            st.success(f"已从飞书加载，共 {len(loaded)} 条记录。")
-                            st.rerun()
-                    if "df_from_feishu" in st.session_state:
-                        df = st.session_state["df_from_feishu"]
-                        st.caption(f"当前显示飞书数据，共 {len(df)} 条。可「导入到数据库」后切换为数据库进行编辑。")
-                        if st.button("✅ 导入到数据库（覆盖）", type="primary", key="feishu_to_db"):
-                            save_to_db(df)
-                            if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(df)} 条记录。"):
-                                    st.success("已导入到数据库并推送至飞书。")
-                                else:
-                                    st.success("已导入到数据库。"); st.warning("飞书推送失败。")
-                            else:
-                                st.success("已导入到数据库。")
-                            del st.session_state["df_from_feishu"]
-                            st.rerun()
-                else:
-                    st.info("请填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
-
-        elif source == "数据库（团队共享）":
-            default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
-            if df_db.empty:
-                # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
-                if default_csv.exists():
-                    try:
-                        df = load_single_csv(str(default_csv))
-                        if not df.empty:
-                            save_to_db(df)
-                            if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已用「{default_csv.name}」初始化，共 {len(df)} 条记录。"):
-                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
-                                else:
-                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
-                            else:
-                                st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。")
-                        else:
-                            st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
-                    except Exception as e:
-                        st.warning(f"无法从默认 CSV 加载：{e}。请通过下方“上传文件”导入。")
-                        df = pd.DataFrame()
-                else:
-                    st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
-            else:
-                if len(df_db) in LEGACY_DB_ROWS_TO_REPLACE and default_csv.exists():
-                    try:
-                        df_new = load_single_csv(str(default_csv))
-                        if not df_new.empty:
-                            save_to_db(df_new)
-                            df_db = df_new
-                    except Exception as e:
-                        st.warning(f"检测到历史旧数据但自动替换失败：{e}")
-                st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
-                df = df_db
-
-        elif source == "上传文件（覆盖数据库）":
-            uploaded = st.file_uploader(
-                "上传 CSV 或 Excel 文件（导入并覆盖数据库）",
-                type=["csv", "xlsx", "xls"],
-                help="支持 .csv 或 .xlsx。xlsx 会按分表自动识别进度表并合并（表头两行、含序号/项目分级/专业/拟定金额）。",
+        if not FEISHU_BITABLE_AVAILABLE:
+            st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
+        elif not os.getenv("FEISHU_APP_ID") or not os.getenv("FEISHU_APP_SECRET"):
+            st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
+        else:
+            bitable_url = st.text_input(
+                "飞书多维表格链接",
+                value=os.getenv(
+                    "FEISHU_BITABLE_URL",
+                    "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
+                ),
+                placeholder="https://xxx.feishu.cn/base/AppToken 或 wiki 链接含 ?table=TableId",
             )
-            if uploaded is not None:
-                suffix = Path(uploaded.name).suffix.lower() or ".csv"
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(uploaded.getvalue())
-                    tmp_path = tmp.name
-                try:
-                    name = uploaded.name
-                    园区名 = "燕园" if "燕园" in name else ("蜀园" if "蜀园" in name else None)
-                    df = load_uploaded(tmp_path, filename=name, 园区名=园区名)
-                    if df.empty:
-                        st.warning("文件已解析但未找到有效数据行。请确认：表头为两行，且含「序号」「项目分级」「专业」「拟定金额」等列。")
-                    else:
-                        st.success(f"已解析：{name}，共 {len(df)} 条记录。")
-                        if st.button("✅ 将本次上传的数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
-                            save_to_db(df)
-                            if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（上传文件：{name}）"):
-                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
-                                else:
-                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
-                            else:
-                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"解析失败：{e}")
-                    import traceback
-                    st.code(traceback.format_exc(), language=None)
-            if df.empty and df_db.empty:
-                single_path = st.text_input("或填写本地文件路径（.csv / .xlsx）并导入数据库", value=DEFAULT_SINGLE_FILE)
-                if single_path and Path(single_path).exists():
-                    try:
-                        df = load_uploaded(single_path, filename=Path(single_path).name)
-                        st.success(f"已从路径加载，共 {len(df)} 条记录。点击下方按钮保存到数据库。")
-                        if st.button("保存到数据库", key="save_from_path"):
-                            save_to_db(df)
-                            if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（本地路径导入）"):
-                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
-                                else:
-                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
-                            else:
-                                st.success("已保存到 SQLite 数据库。")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"加载失败：{e}")
+            _remember_bitable_url_from_sidebar(bitable_url)
+            if st.button("🔄 从飞书加载", key="load_feishu"):
+                if not (bitable_url or "").strip():
+                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
                 else:
-                    st.info("请在上方上传 CSV/Excel，或填写有效的本地文件路径。")
-            if df.empty and not df_db.empty:
-                df = df_db
-
-        else:  # 目录下全部 CSV（覆盖数据库）
-            dir_path = st.text_input("数据目录路径（导入并覆盖数据库）", value=DEFAULT_DATA_DIR)
-            pattern = st.text_input("文件名匹配", value="*养老*进度*.csv")
-            if dir_path and Path(dir_path).is_dir():
-                try:
-                    df = load_from_directory(dir_path, pattern)
-                    if df.empty:
-                        st.warning("目录已扫描但未解析到有效数据，请检查文件名与表头格式。")
+                    with st.spinner("正在从飞书加载..."):
+                        loaded = load_from_bitable(bitable_url.strip())
+                    if loaded.empty:
+                        st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
                     else:
-                        st.success(f"已从目录加载，共 {len(df)} 条记录。")
-                        if st.button("✅ 将目录数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
-                            save_to_db(df)
-                            if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（目录导入）"):
-                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                        st.session_state["feishu_bitable_url"] = bitable_url.strip()
+                        os.environ["FEISHU_LAST_BITABLE_URL"] = bitable_url.strip()
+                        save_to_db(loaded, sync_feishu=False)
+                        msg = f"已从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。"
+                        if _get_feishu_webhook_url():
+                            try:
+                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(loaded)} 条记录。"):
+                                    st.success(msg + " 已推送通知至飞书。")
                                 else:
-                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
-                            else:
-                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"加载失败：{e}")
-            else:
-                st.warning("请填写有效目录路径")
+                                    st.success(msg)
+                                    st.warning("飞书 Webhook 推送失败。")
+                            except Exception:
+                                st.success(msg)
+                        else:
+                            st.success(msg)
+                        st.rerun()
+
+        df_db = load_from_db()
+        df = df_db if not df_db.empty else pd.DataFrame()
+        if not df.empty:
+            st.caption(f"当前数据：共 {len(df)} 条。点击「从飞书加载」可从飞书刷新并覆盖本地缓存。")
 
         if not df.empty:
             parks = df["园区"].dropna().unique().tolist()
@@ -5800,7 +5760,7 @@ def main():
             园区选择 = []
 
     if df.empty:
-        st.warning("请先在侧边栏选择或上传数据源。")
+        st.warning("请先在侧边栏填写飞书多维表格链接并点击「从飞书加载」。")
         render_审核流程说明()
         return
 
@@ -5812,7 +5772,7 @@ def main():
         has_prof = "专业" in df.columns and df["专业"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
         has_name = "项目名称" in df.columns and df["项目名称"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
         if not has_prof or not has_name:
-            st.warning("当前数据中「专业」「项目名称」等列多为空，可能是旧库列对齐问题。请用侧边栏「上传文件（覆盖数据库）」重新上传 **改良改造报表-V4.csv** 并保存，即可修复显示。")
+            st.warning("当前数据中「专业」「项目名称」等列多为空，请检查飞书表格列名是否与看板要求一致，或重新从飞书加载。")
 
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)

@@ -12,7 +12,7 @@ TIMELINE_COLS = [
 # 验收列多种写法统一为「验收」
 TIMELINE_COL_MAP = {"验收(社区需求完成交付)": "验收", "验收(社区结算)": "验收"}
 # 进度表关键列，用于自动识别是否为有效分表
-KEY_COLS = ("序号", "项目分级", "专业", "拟定金额", "项目名称")
+KEY_COLS = ("序号", "项目分级", "专业", "实际预计金额", "项目名称")
 PARK_TOKENS = ["燕园", "蜀园", "吴园", "粤园", "申园", "楚园", "鹭园", "大清谷", "湘园", "沈园", "桂园", "琴园",
                "赣园", "苏园", "甬园", "豫园", "渝园", "徽园", "鹏园", "瓯园", "福园", "儒园", "津园", "滇园"]
 
@@ -66,16 +66,16 @@ def _parse_header_from_rows(row0, row1, n_time: int = 9):
 
 
 def _is_progress_sheet(names: list) -> bool:
-    """根据列名判断是否为进度表分表（含序号、项目分级/专业/拟定金额等）。"""
+    """根据列名判断是否为进度表分表（含序号、项目分级/专业/实际预计金额等）。"""
     names_set = {str(x).strip() for x in names if x}
     has_序号 = "序号" in names_set or "编号" in names_set
-    has_key = any(k in names_set for k in ["项目分级", "专业", "拟定金额", "项目名称"])
+    has_key = any(k in names_set for k in ["项目分级", "专业", "拟定金额", "实际预计金额", "项目名称"])
     return has_序号 and has_key
 
 
 def _normalize_loaded_df(df: pd.DataFrame, 园区名: str = None, default_园区_from: str = "") -> pd.DataFrame:
     """
-    对已设好列名的 DataFrame 做统一规范化：验收列简称、拟定承建组织、序号过滤、合计行、拟定金额、园区。
+    对已设好列名的 DataFrame 做统一规范化：验收列简称、拟定承建组织、序号过滤、合计行、实际预计金额、园区。
     default_园区_from 用于从文件名或 sheet 名解析园区（如含「燕园」）。
     """
     if df.empty:
@@ -86,6 +86,9 @@ def _normalize_loaded_df(df: pd.DataFrame, 园区名: str = None, default_园区
             names[i] = "验收"
     names = [str(x).strip().strip("\ufeff") for x in names]
     df.columns = names
+    # 兼容旧表头「拟定金额」
+    if "拟定金额" in df.columns and "实际预计金额" not in df.columns:
+        df = df.rename(columns={"拟定金额": "实际预计金额"})
     if "拟定承建组" in df.columns and "拟定承建组织" not in df.columns:
         df = df.rename(columns={"拟定承建组": "拟定承建组织"})
     # 序号列
@@ -105,8 +108,8 @@ def _normalize_loaded_df(df: pd.DataFrame, 园区名: str = None, default_园区
     序号列名 = 序号列.name if 序号列 is not None else None
     if 序号列名 and 序号列名 in df.columns:
         df = df.loc[~df[序号列名].astype(str).str.strip().str.match(r"^(合计|差额|小计|合计行)", na=False)].copy()
-    if "拟定金额" in df.columns:
-        df["拟定金额"] = pd.to_numeric(df["拟定金额"], errors="coerce").fillna(0).astype(int)
+    if "实际预计金额" in df.columns:
+        df["实际预计金额"] = pd.to_numeric(df["实际预计金额"], errors="coerce").fillna(0).astype(int)
     # 检查是否有"社区"列，如果有则重命名为"园区"
     if "社区" in df.columns and "园区" not in df.columns:
         df = df.rename(columns={"社区": "园区"})
@@ -196,11 +199,11 @@ def _load_flat_progress_csv(path: Path) -> pd.DataFrame:
     
     if is_new_format:
         # 改良改造报表-V4.csv：表头两行后为数据，严格按列位置读取前 14 列，避免多列/错位导致后面列读不出
-        # 源表顺序：序号,社区,所属区域,所在城市,所属业态,项目分级,项目分类,拟定承建组织,总部重点关注项目,专业,专业分包,项目名称,备注说明,拟定金额
+        # 源表顺序：序号,社区,所属区域,所在城市,所属业态,项目分级,项目分类,拟定承建组织,总部重点关注项目,专业,专业分包,项目名称,备注说明,实际预计金额
         CANONICAL_14 = [
             "序号", "社区", "所属区域", "城市", "所属业态",
             "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
-            "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+            "专业", "专业分包", "项目名称", "备注说明", "实际预计金额",
         ]
         df = pd.read_csv(
             path, header=None, skiprows=2, encoding=encoding,
@@ -213,13 +216,13 @@ def _load_flat_progress_csv(path: Path) -> pd.DataFrame:
         if n < 14:
             for c in CANONICAL_14[n:]:
                 df[c] = ""
-        # 拟定金额、序号转数值；社区→园区等
+        # 实际预计金额、序号转数值；社区→园区等
         df = _normalize_loaded_df(df, 园区名=None, default_园区_from=path.stem)
     else:
         # 原有格式处理
         # 检查第一行是否是列名：如果包含"序号"、"园区"、"社区"等关键词，则认为是列名
         has_header = False
-        header_keywords = ["序号", "园区", "社区", "项目名称", "项目分级", "专业", "拟定金额"]
+        header_keywords = ["序号", "园区", "社区", "项目名称", "项目分级", "专业", "拟定金额", "实际预计金额"]
         for cell in line0:
             if any(keyword in str(cell) for keyword in header_keywords):
                 has_header = True
@@ -350,7 +353,7 @@ def load_single_csv(path: str, 园区名: str = None) -> pd.DataFrame:
 
 def load_single_xlsx(path: str, 园区名: str = None) -> pd.DataFrame:
     """
-    加载 XLSX：读取所有工作表，自动识别进度表分表（含序号、项目分级/专业/拟定金额等），
+    加载 XLSX：读取所有工作表，自动识别进度表分表（含序号、项目分级/专业/实际预计金额等），
     支持两行表头，按 sheet 名或文件名解析园区并合并为一张表。
     """
     path = Path(path)
