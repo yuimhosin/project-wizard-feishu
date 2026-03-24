@@ -14,6 +14,7 @@ import pandas as pd
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
 _last_error = ""
+FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 
 def _set_last_error(msg: str):
@@ -383,6 +384,8 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
         # 业务适配：用户要求「园区=sheet名」
         if sheet_name:
             df["园区"] = sheet_name
+        # 行号标识（用于后续写回时定位；1 为表头，数据从 2 开始）
+        df[FEISHU_RECORD_ID_COL] = [str(i) for i in range(2, len(df) + 2)]
         return df
     except Exception as e:
         _set_last_error(f"读取 sheets 异常：{_format_http_error(e)}")
@@ -629,7 +632,8 @@ def load_from_bitable(url_or_id: str, load_all_sheets: bool = False) -> pd.DataF
                 items = d.get("items", [])
                 for rec in items:
                     fields = rec.get("fields", {})
-                    flat = {}
+                    rid = rec.get("record_id") or ""
+                    flat = {FEISHU_RECORD_ID_COL: str(rid).strip() if rid else ""}
                     for k, v in fields.items():
                         if k in ("file_token", "tmp_url", "avatar_url"):
                             continue
@@ -648,3 +652,134 @@ def load_from_bitable(url_or_id: str, load_all_sheets: bool = False) -> pd.DataF
 
     _set_last_error("")
     return pd.DataFrame(all_records)
+
+
+def _col_idx_to_letter(idx: int) -> str:
+    n = idx + 1
+    letters = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(65 + rem))
+    return "".join(reversed(letters)) or "A"
+
+
+def _sheet_join_range(sheet_id: str, a1: str) -> str:
+    return f"{sheet_id}!{a1}"
+
+
+def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: list, token: str) -> tuple[bool, str]:
+    body = {
+        "valueRange": {
+            "range": _sheet_join_range(sheet_id, a1),
+            "values": values,
+        }
+    }
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values"
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") == 0:
+            return True, ""
+        return False, f"code={data.get('code')} msg={data.get('msg')}"
+    except Exception as e:
+        return False, _format_http_error(e)
+
+
+def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool, str]:
+    """
+    将 DataFrame 全量覆盖写回飞书电子表格（Sheets）。
+    - 第 1 行写表头
+    - 第 2 行开始写数据（分块）
+    - 若新数据比旧数据少，会把剩余区域清空
+    """
+    spreadsheet_token, sheet_id = _parse_sheets_url(url_or_id)
+    if not spreadsheet_token:
+        return False, "链接不是 sheets 地址，未执行电子表格写回。"
+    token = _get_tenant_access_token()
+    if not token:
+        return False, get_last_error() or "无法获取 tenant_access_token。"
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not sheet_id:
+        return False, "无法解析 sheet_id。"
+
+    if df_new is None:
+        return False, "待写回数据为空。"
+
+    # 保留业务列，跳过内部列
+    cols = [c for c in df_new.columns if str(c).strip() and not str(c).startswith("__")]
+    if not cols:
+        return False, "无可写回列。"
+
+    # 旧行数（不含表头），用于清空尾部
+    old_df = _load_from_sheets(spreadsheet_token, sheet_id, token)
+    old_rows = 0 if old_df is None else len(old_df)
+
+    # 1) 写表头
+    last_col = _col_idx_to_letter(len(cols) - 1)
+    ok, err = _put_sheets_range(spreadsheet_token, sheet_id, f"A1:{last_col}1", [cols], token)
+    if not ok:
+        return False, f"写入表头失败：{err}"
+
+    # 2) 写数据（分块）
+    values = []
+    for _, row in df_new.iterrows():
+        one = []
+        for c in cols:
+            v = row.get(c, "")
+            if pd.isna(v) or v is None:
+                one.append("")
+            elif isinstance(v, (int, float)):
+                one.append(v)
+            else:
+                one.append(str(v))
+        values.append(one)
+
+    chunk_size = 400
+    for i in range(0, len(values), chunk_size):
+        chunk = values[i : i + chunk_size]
+        start = i + 2
+        end = start + len(chunk) - 1
+        ok, err = _put_sheets_range(
+            spreadsheet_token,
+            sheet_id,
+            f"A{start}:{last_col}{end}",
+            chunk,
+            token,
+        )
+        if not ok:
+            return False, f"写入数据失败（{start}-{end}）：{err}"
+
+    # 3) 清空尾部旧数据（仅清空，不删行）
+    new_rows = len(values)
+    if old_rows > new_rows:
+        blank_rows = old_rows - new_rows
+        start = new_rows + 2
+        end = old_rows + 1
+        blanks = [["" for _ in cols] for _ in range(blank_rows)]
+        for i in range(0, len(blanks), chunk_size):
+            chunk = blanks[i : i + chunk_size]
+            s = start + i
+            e = s + len(chunk) - 1
+            ok, err = _put_sheets_range(
+                spreadsheet_token,
+                sheet_id,
+                f"A{s}:{last_col}{e}",
+                chunk,
+                token,
+            )
+            if not ok:
+                return False, f"清空旧尾部失败（{s}-{e}）：{err}"
+
+    _set_last_error("")
+    return True, f"已写回飞书电子表格，共 {len(values)} 条。"

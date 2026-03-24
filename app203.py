@@ -23,10 +23,12 @@ try:
         load_from_bitable,
         get_last_error as get_bitable_last_error,
         list_sheets_from_sheets_url,
+        sync_sheets_full_replace,
     )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
+    sync_sheets_full_replace = None  # type: ignore
 
 try:
     from feishu_oauth import build_authorize_url, exchange_code_for_user
@@ -270,13 +272,27 @@ def load_from_db() -> pd.DataFrame:
 
 
 def save_to_db(df: pd.DataFrame):
-    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）。"""
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。"""
     if df is None or df.empty:
         return
     engine = _get_db_engine()
     # 用事务保证 replace 的一致性
     with engine.begin() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
+    try:
+        url = str(st.session_state.get("feishu_bitable_url") or "").strip()
+    except Exception:
+        url = ""
+    if "/sheets/" in url and sync_sheets_full_replace is not None:
+        ok, msg = sync_sheets_full_replace(url, df)
+        try:
+            if ok:
+                st.session_state["feishu_sync_last_ok"] = msg
+                st.session_state["feishu_sync_last_error"] = ""
+            else:
+                st.session_state["feishu_sync_last_error"] = msg
+        except Exception:
+            pass
 
 
 def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -5749,6 +5765,11 @@ def _require_feishu_login() -> bool:
 def main():
     if not _require_feishu_login():
         return
+    if st.session_state.get("feishu_sync_last_error"):
+        st.error(f"飞书写回失败：{st.session_state['feishu_sync_last_error']}")
+    ok_msg = st.session_state.pop("feishu_sync_last_ok", None)
+    if ok_msg:
+        st.success(ok_msg)
 
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
@@ -5763,7 +5784,7 @@ def main():
                 del st.session_state["feishu_user"]
                 st.rerun()
         st.header("数据源")
-        st.caption("仅支持从飞书多维表格加载；加载后写入本地缓存（SQLite），向导中的修改会保存到该缓存。")
+        st.caption("支持从飞书表格加载；加载后写入本地缓存（SQLite）。向导保存时会尝试回写到飞书 Sheets（若当前链接为 /sheets/）。")
 
         _ensure_feishu_secrets_in_env()
         feishu_app_id = str(os.getenv("FEISHU_APP_ID", "")).strip()
@@ -5779,6 +5800,10 @@ def main():
                 value=_default_feishu_table_url(),
                 placeholder="支持 sheets/base/wiki 链接；wiki/base 建议带 ?table=TableId",
             )
+            try:
+                st.session_state["feishu_bitable_url"] = (bitable_url or "").strip()
+            except Exception:
+                pass
             load_all_sheets = st.checkbox("读取全部园区（较慢）", value=False, key="load_all_sheets_feishu")
 
             if st.button("🔄 从飞书加载", key="load_feishu"):
