@@ -5308,16 +5308,31 @@ def _render_project_wizard(df: pd.DataFrame):
             return
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
-        # 若当前 df_all 里尚未包含该园区（典型：首屏只加载一个 sheet），则按需拉取该园区数据
-        have_parks = set(map(str, df_all["园区"].dropna().astype(str).unique().tolist())) if "园区" in df_all.columns else set()
-        if st.session_state.get("feishu_sheets_meta") and "园区" in df_all.columns and str(园区) not in have_parks:
+        # 关键修复：步骤1切换园区后，同步更新当前写回目标 sheet 链接，避免保存仍写到旧分表
+        park_to_sheet_id = {}
+        if st.session_state.get("feishu_sheets_meta"):
             meta = st.session_state.get("feishu_sheets_meta") or []
-            park_to_sheet_id = {}
             for x in meta:
                 name = str(x.get("sheet_name") or "").strip()
                 sid = str(x.get("sheet_id") or "").strip()
                 if name and sid and name not in park_to_sheet_id:
                     park_to_sheet_id[name] = sid
+            sid_selected = park_to_sheet_id.get(str(园区))
+            base_url = st.session_state.get("feishu_bitable_url") or ""
+            if sid_selected and base_url:
+                if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
+                    url_sheet_selected = re.sub(
+                        r"([?&]sheet=)[A-Za-z0-9_]+",
+                        lambda m: m.group(1) + sid_selected,
+                        base_url,
+                    )
+                else:
+                    join = "&" if "?" in base_url else "?"
+                    url_sheet_selected = base_url + f"{join}sheet={sid_selected}"
+                st.session_state["feishu_bitable_url"] = url_sheet_selected
+        # 若当前 df_all 里尚未包含该园区（典型：首屏只加载一个 sheet），则按需拉取该园区数据
+        have_parks = set(map(str, df_all["园区"].dropna().astype(str).unique().tolist())) if "园区" in df_all.columns else set()
+        if st.session_state.get("feishu_sheets_meta") and "园区" in df_all.columns and str(园区) not in have_parks:
             sid = park_to_sheet_id.get(str(园区))
             base_url = st.session_state.get("feishu_bitable_url") or ""
             if sid and base_url:
