@@ -723,6 +723,41 @@ def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: li
         return False, _format_http_error(e)
 
 
+def _detect_sheet_data_start_row(spreadsheet_token: str, sheet_id: str, token: str) -> int:
+    """
+    探测分表首条数据行（默认 2）。
+    规则：扫描 A1:A80，找到首个“正整数序号”所在行作为数据起始行。
+    """
+    try:
+        scan_range = f"{sheet_id}!A1:A80"
+        encoded = urllib.parse.quote(scan_range, safe="")
+        url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded}"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") != 0:
+            return 2
+        values = (data.get("data") or {}).get("valueRange", {}).get("values", []) or []
+        for i, row in enumerate(values, start=1):
+            if not row:
+                continue
+            first = str(row[0]).strip() if row[0] is not None else ""
+            if not first:
+                continue
+            # 序号一般是正整数；用它定位首条数据行，兼容多行表头
+            if re.fullmatch(r"\d+", first):
+                n = int(first)
+                if n >= 1:
+                    return i
+        return 2
+    except Exception:
+        return 2
+
+
 def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool, str]:
     """
     将 DataFrame 全量覆盖写回飞书电子表格（Sheets）。
@@ -775,11 +810,14 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     if not target_cols:
         return False, "目标表头为空，无法写回。"
 
+    # 探测原始分表的数据起始行（有些分表是多行表头，不一定从第2行开始）
+    data_start_row = _detect_sheet_data_start_row(spreadsheet_token, sheet_id, token)
+
     # 旧行数（不含表头），用于清空尾部
     old_df = _load_from_sheets(spreadsheet_token, sheet_id, token)
     old_rows = 0 if old_df is None else len(old_df)
 
-    # 1) 写数据（分块）- 从第2行开始，不覆盖原表头
+    # 1) 写数据（分块）- 从探测到的数据起始行开始，不覆盖原表头区域
     last_col = _col_idx_to_letter(len(target_cols) - 1)
 
     def _resolve_source_col(target_col: str) -> str | None:
@@ -817,7 +855,7 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     chunk_size = 400
     for i in range(0, len(values), chunk_size):
         chunk = values[i : i + chunk_size]
-        start = i + 2
+        start = i + data_start_row
         end = start + len(chunk) - 1
         ok, err = _put_sheets_range(
             spreadsheet_token,
@@ -833,8 +871,8 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     new_rows = len(values)
     if old_rows > new_rows:
         blank_rows = old_rows - new_rows
-        start = new_rows + 2
-        end = old_rows + 1
+        start = data_start_row + new_rows
+        end = data_start_row + old_rows - 1
         blanks = [["" for _ in target_cols] for _ in range(blank_rows)]
         for i in range(0, len(blanks), chunk_size):
             chunk = blanks[i : i + chunk_size]
