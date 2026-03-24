@@ -190,15 +190,65 @@ def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> li
     return [x for x in opts if x and str(x).strip() != "nan"]
 
 
+def _guess_single_select_options(df: pd.DataFrame, col: str) -> list[str]:
+    """
+    自动推断单选字段候选值（小规模离散列）。
+    用于适配飞书单选列，避免在修改表单里用自由文本输入。
+    """
+    if col not in df.columns:
+        return []
+    try:
+        vals = [str(x).strip() for x in df[col].dropna().tolist()]
+        vals = [x for x in vals if x and x.lower() not in {"nan", "none", "null"}]
+        uniq = sorted(set(vals))
+        # 值太多或太长，一般不是单选字段
+        if len(uniq) < 2 or len(uniq) > 20:
+            return []
+        if any(len(x) > 20 for x in uniq):
+            return []
+        return uniq
+    except Exception:
+        return []
+
+
 DATE_RANGE_MIN = date(2020, 1, 1)
 DATE_RANGE_MAX = date(2030, 12, 31)
 SENTINEL_DATE = date(2000, 1, 1)  # 表示未填写
+
+
+def _excel_serial_to_date(value) -> date | None:
+    """
+    将 Excel 日期序列号转为 date。
+    例如 46023 -> 2025-12-31（按 Excel 1900 日期系统，基准 1899-12-30）。
+    """
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        n = float(s)
+        # 经验范围：避免把普通数字误识别为日期
+        if n < 30000 or n > 70000:
+            return None
+        dt = pd.to_datetime(n, unit="D", origin="1899-12-30", errors="coerce")
+        if pd.isna(dt):
+            return None
+        d = dt.date()
+        if not (DATE_RANGE_MIN <= d <= DATE_RANGE_MAX):
+            return None
+        return d
+    except Exception:
+        return None
 
 
 def _str_to_date(s) -> date:
     """字符串转 date，空或无效则返回 SENTINEL_DATE。"""
     if not s or (isinstance(s, str) and not str(s).strip()):
         return SENTINEL_DATE
+    d_excel = _excel_serial_to_date(s)
+    if d_excel is not None:
+        return d_excel
     try:
         dt = pd.to_datetime(s, errors="coerce", format="mixed")
         if pd.isna(dt):
@@ -218,6 +268,15 @@ def _date_to_str(d) -> str:
     if isinstance(d, date):
         return d.strftime("%Y-%m-%d")
     return str(d) if d else ""
+
+
+def _normalize_timeline_value(v) -> str:
+    """标准化时间节点单元格：Excel 序列/日期字符串 -> YYYY-MM-DD，空值保持空字符串。"""
+    d = _str_to_date(v)
+    if d != SENTINEL_DATE:
+        return _date_to_str(d)
+    s = str(v).strip() if v is not None else ""
+    return "" if s.lower() in {"", "nan", "none", "null"} else s
 
 # ---------- 团队共享数据：默认 SQLite，可与 elderly-dashboard 等共用 MySQL ----------
 # 优先级：APP203_DATABASE_URL > MYSQL_* 组合 > 本地 SQLite（APP203_DB_PATH）
@@ -390,6 +449,10 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
         out["实际预计金额"] = pd.to_numeric(out["实际预计金额"], errors="coerce").fillna(0)
     if "序号" in out.columns:
         out["序号"] = pd.to_numeric(out["序号"], errors="coerce")
+    # 时间节点列：把 Excel 序列日期统一转为 YYYY-MM-DD，修复 46023 这类“日期乱码”
+    for tcol in TIMELINE_COLS:
+        if tcol in out.columns:
+            out[tcol] = out[tcol].apply(_normalize_timeline_value)
     base_order = [
         "序号", "园区", "所属区域", "城市", "所属业态",
         "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
@@ -471,6 +534,9 @@ def _format_cell(v) -> str:
     """用于变更详情展示：None/NaN 显示为空字符串。"""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
+    d_excel = _excel_serial_to_date(v)
+    if d_excel is not None:
+        return d_excel.strftime("%Y-%m-%d")
     return str(v).strip()
 
 
@@ -5622,7 +5688,17 @@ def _render_project_wizard(df: pd.DataFrame):
                         elif col == "备注说明":
                             updates[col] = st.text_area(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
                         else:
-                            updates[col] = st.text_input(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
+                            dyn_opts = _guess_single_select_options(df_all, col)
+                            if dyn_opts:
+                                v = str(current_val or "")
+                                updates[col] = st.selectbox(
+                                    col,
+                                    options=[""] + dyn_opts,
+                                    index=(dyn_opts.index(v) + 1) if v in dyn_opts else 0,
+                                    key=f"edit_info_{row_id}_{col}",
+                                )
+                            else:
+                                updates[col] = st.text_input(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
 
                 save_info_clicked = st.form_submit_button("💾 保存项目信息更改")
 
