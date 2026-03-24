@@ -5325,8 +5325,6 @@ def _render_project_wizard(df: pd.DataFrame):
                 if sid in cache and cache[sid] is not None and not cache[sid].empty:
                     df_all = _ensure_project_columns(cache[sid])
                 else:
-                    import re
-
                     if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
                         url_sheet = re.sub(
                             r"([?&]sheet=)[A-Za-z0-9_]+",
@@ -5826,8 +5824,6 @@ def main():
                 if not (bitable_url or "").strip():
                     st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。")
                 else:
-                    import re
-
                     sheets_meta = []
                     sheet_names = []
                     if "/sheets/" in bitable_url:
@@ -5953,8 +5949,6 @@ def main():
             cache = st.session_state.get("feishu_df_cache_by_sheet_id") or {}
             base_url = st.session_state.get("feishu_bitable_url") or ""
             if base_url:
-                import re
-
                 for p in missing_parks:
                     sid = park_to_sheet_id.get(p)
                     if not sid:
