@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, date
 from functools import lru_cache
 from urllib.parse import quote_plus
-from data_loader import get_稳定需求_mask, TIMELINE_COLS
+from data_loader import get_稳定需求_mask, TIMELINE_COLS, TIMELINE_COL_MAP
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
@@ -297,6 +297,14 @@ def _resolve_timeline_column(df: pd.DataFrame, chosen_col: str) -> str | None:
     chosen = str(chosen_col).strip()
     if not chosen:
         return None
+    # 优先回写到“原表头”列（如 验收(社区需求完成交付)），保持与飞书原结构一致
+    preferred = []
+    for raw_name, std_name in TIMELINE_COL_MAP.items():
+        if str(std_name).strip() == chosen:
+            preferred.append(str(raw_name).strip())
+    for p in preferred:
+        if p in df.columns:
+            return p
     # 去括号做弱匹配
     base = re.sub(r"[（(].*?[)）]", "", chosen).strip()
     for c in df.columns:
