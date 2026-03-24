@@ -5383,8 +5383,33 @@ def _render_project_wizard(df: pd.DataFrame):
                 candidates = df_all.copy()
 
         candidates = candidates[candidates["园区"].astype(str) == str(园区)].copy()
+        if candidates.empty and st.session_state.get("feishu_sheets_meta"):
+            # 兜底：若筛选后为空，强制按当前园区对应 sheet_id 再拉一次，避免因分表结构/园区名差异误判为空
+            sid = park_to_sheet_id.get(str(园区))
+            base_url = st.session_state.get("feishu_bitable_url") or ""
+            if sid and base_url:
+                if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
+                    url_sheet = re.sub(
+                        r"([?&]sheet=)[A-Za-z0-9_]+",
+                        lambda m: m.group(1) + sid,
+                        base_url,
+                    )
+                else:
+                    join = "&" if "?" in base_url else "?"
+                    url_sheet = base_url + f"{join}sheet={sid}"
+                df_one = load_from_bitable(url_sheet, load_all_sheets=False)
+                if df_one is not None and not df_one.empty:
+                    df_one = _ensure_project_columns(df_one)
+                    # 统一当前分表的园区值，确保步骤1筛选可命中
+                    df_one["园区"] = str(园区)
+                    cache = st.session_state.get("feishu_df_cache_by_sheet_id") or {}
+                    cache[sid] = df_one
+                    st.session_state["feishu_df_cache_by_sheet_id"] = cache
+                    st.session_state["feishu_bitable_url"] = url_sheet
+                    df_all = df_one.copy()
+                    candidates = df_all[df_all["园区"].astype(str) == str(园区)].copy()
         if candidates.empty:
-            st.info("该园区下未找到项目记录，请尝试更换园区。")
+            st.info("该园区下未找到项目记录，请尝试更换园区或先点击「从飞书加载」。")
             return
 
         if candidates.empty:
@@ -5850,9 +5875,13 @@ def main():
         elif not feishu_app_id or not feishu_app_secret:
             st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
         else:
+            current_url = str(
+                st.session_state.get("feishu_bitable_url")
+                or _default_feishu_table_url()
+            ).strip()
             bitable_url = st.text_input(
                 "飞书多维表格链接",
-                value=_default_feishu_table_url(),
+                value=current_url,
                 placeholder="支持 sheets/base/wiki 链接；wiki/base 建议带 ?table=TableId",
             )
             try:
@@ -5860,47 +5889,48 @@ def main():
             except Exception:
                 pass
             load_all_sheets = st.checkbox("读取全部园区（较慢）", value=False, key="load_all_sheets_feishu")
-
-            if st.button("🔄 从飞书加载", key="load_feishu"):
-                if not (bitable_url or "").strip():
-                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。")
+            if not (bitable_url or "").strip():
+                st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。")
+            else:
+                sheets_meta = []
+                sheet_names = []
+                if "/sheets/" in bitable_url:
+                    try:
+                        sheets_meta = list_sheets_from_sheets_url(bitable_url.strip())
+                    except Exception:
+                        sheets_meta = []
+                    sheet_names = [x.get("sheet_name", "") for x in sheets_meta if x.get("sheet_name")]
+                    st.caption(f"飞书 sheets/query 结构读取：{len(sheet_names)} 个园区（sheet 名）")
+                    st.session_state["feishu_sheet_names"] = sheet_names
+                    st.session_state["feishu_sheets_meta"] = sheets_meta
+                st.session_state["feishu_bitable_url"] = bitable_url.strip()
+                if "feishu_df_cache_by_sheet_id" not in st.session_state:
+                    st.session_state["feishu_df_cache_by_sheet_id"] = {}
+                if load_all_sheets:
+                    st.session_state["feishu_default_parks"] = sheet_names
                 else:
-                    sheets_meta = []
-                    sheet_names = []
-                    if "/sheets/" in bitable_url:
-                        try:
-                            sheets_meta = list_sheets_from_sheets_url(bitable_url.strip())
-                        except Exception:
-                            sheets_meta = []
-                        sheet_names = [x.get("sheet_name", "") for x in sheets_meta if x.get("sheet_name")]
-                        st.caption(f"飞书 sheets/query 结构读取：{len(sheet_names)} 个园区（sheet 名）")
-                        st.session_state["feishu_sheet_names"] = sheet_names
-                        st.session_state["feishu_sheets_meta"] = sheets_meta
-                    st.session_state["feishu_bitable_url"] = bitable_url.strip()
-                    if "feishu_df_cache_by_sheet_id" not in st.session_state:
-                        st.session_state["feishu_df_cache_by_sheet_id"] = {}
-                    if load_all_sheets:
-                        st.session_state["feishu_default_parks"] = sheet_names
-                    else:
-                        m = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", bitable_url.strip())
-                        target_sid = m.group(1) if m else ""
-                        default_name = ""
-                        if target_sid and sheets_meta:
-                            for x in sheets_meta:
-                                if str(x.get("sheet_id") or "").strip() == str(target_sid).strip():
-                                    default_name = str(x.get("sheet_name") or "").strip()
-                                    break
-                        if not default_name and sheets_meta:
-                            default_name = str(sheets_meta[0].get("sheet_name") or "").strip()
-                        st.session_state["feishu_default_parks"] = [default_name] if default_name else []
+                    m = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", bitable_url.strip())
+                    target_sid = m.group(1) if m else ""
+                    default_name = ""
+                    if target_sid and sheets_meta:
+                        for x in sheets_meta:
+                            if str(x.get("sheet_id") or "").strip() == str(target_sid).strip():
+                                default_name = str(x.get("sheet_name") or "").strip()
+                                break
+                    if not default_name and sheets_meta:
+                        default_name = str(sheets_meta[0].get("sheet_name") or "").strip()
+                    st.session_state["feishu_default_parks"] = [default_name] if default_name else []
 
-                    with st.spinner("正在从飞书加载..."):
+                # 自动加载：页面打开后首次（或链接变化）自动从飞书拉取，无需手动点击按钮
+                auto_key = f"{bitable_url.strip()}|{1 if load_all_sheets else 0}"
+                if st.session_state.get("feishu_auto_loaded_key") != auto_key:
+                    with st.spinner("正在自动从飞书加载..."):
                         loaded = load_from_bitable(
                             bitable_url.strip(),
                             load_all_sheets=load_all_sheets,
                         )
                     if loaded.empty:
-                        st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
+                        st.warning("自动加载未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
                         try:
                             err = get_bitable_last_error()
                             if err:
@@ -5909,18 +5939,8 @@ def main():
                             pass
                     else:
                         save_to_db(loaded)
-                        msg = f"已从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。"
-                        if _get_feishu_webhook_url():
-                            try:
-                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(loaded)} 条记录。"):
-                                    st.success(msg + " 已推送通知至飞书。")
-                                else:
-                                    st.success(msg)
-                                    st.warning("飞书 Webhook 推送失败。")
-                            except Exception:
-                                st.success(msg)
-                        else:
-                            st.success(msg)
+                        st.session_state["feishu_auto_loaded_key"] = auto_key
+                        st.success(f"已自动从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。")
                         st.rerun()
 
         df_db = load_from_db()
