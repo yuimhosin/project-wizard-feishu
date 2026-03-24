@@ -387,6 +387,7 @@ def save_to_db(df: pd.DataFrame):
         url = ""
     if "/sheets/" in url and sync_sheets_full_replace is not None:
         df_sync = df
+        target_park = ""
         try:
             # 关键修复：当前 URL 指向单个分表时，只回写该分表对应园区的数据，避免把多园区整表写进一个分表
             m_sid = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", url)
@@ -407,6 +408,11 @@ def save_to_db(df: pd.DataFrame):
                     df_sync = sub
         except Exception:
             df_sync = df
+        try:
+            park_preview = target_park or "（未识别，按当前数据集）"
+            st.info(f"写回前预览：当前将写回园区={park_preview}、条数={len(df_sync)}")
+        except Exception:
+            pass
         ok, msg = sync_sheets_full_replace(url, df_sync)
         try:
             if ok:
