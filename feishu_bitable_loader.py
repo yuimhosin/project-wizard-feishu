@@ -505,6 +505,24 @@ def _normalize_sheets_df(df: pd.DataFrame) -> pd.DataFrame:
     if keep_cols:
         out = out[keep_cols].copy()
 
+    # 删除占位列（列11/列12...）：结构不统一时常出现，且大多为空
+    try:
+        drop_placeholder = []
+        for c in out.columns:
+            name = str(c).strip()
+            if not re.fullmatch(r"列\d+", name):
+                continue
+            s = out[c].astype(str).str.strip().str.lower()
+            non_empty = (~s.isin(["", "nan", "none", "null"])).sum()
+            ratio = float(non_empty) / max(len(out), 1)
+            # 占位列只有极少量有效值时直接丢弃，避免污染编辑表单
+            if ratio <= 0.1:
+                drop_placeholder.append(c)
+        if drop_placeholder:
+            out = out.drop(columns=drop_placeholder, errors="ignore")
+    except Exception:
+        pass
+
     # 删除全空行
     row_non_empty = out.astype(str).apply(lambda col: col.str.strip()).apply(
         lambda col: col.ne("") & col.str.lower().ne("nan")

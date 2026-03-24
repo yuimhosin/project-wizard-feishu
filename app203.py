@@ -312,7 +312,20 @@ def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     """去掉列名为空字符串的列，避免 data_editor 因重复空列名报错。"""
     keep_cols = [c for c in df.columns if str(c).strip() != ""]
-    return df[keep_cols].copy()
+    out = df[keep_cols].copy()
+    # 过滤掉结构不统一带来的占位列（列11/列12...）与内部列，避免界面出现大量空输入框
+    out_cols = []
+    for c in out.columns:
+        cs = str(c).strip()
+        if cs.startswith("__"):
+            continue
+        if re.fullmatch(r"列\d+", cs):
+            s = out[c].astype(str).str.strip().str.lower()
+            non_empty = (~s.isin(["", "nan", "none", "null"])).sum()
+            if float(non_empty) / max(len(out), 1) <= 0.1:
+                continue
+        out_cols.append(c)
+    return out[out_cols].copy()
 
 
 def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -5495,6 +5508,8 @@ def _render_project_wizard(df: pd.DataFrame):
                 readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
                 editable_cols = [c for c in df_all.columns if c not in set(TIMELINE_COLS)]
                 editable_cols = [str(c).strip() for c in editable_cols if str(c).strip() and str(c).strip().lower() not in {"nan", "none", "null"}]
+                editable_cols = [c for c in editable_cols if not c.startswith("__")]
+                editable_cols = [c for c in editable_cols if not re.fullmatch(r"列\d+", c)]
                 editable_cols = [c for c in editable_cols if c not in readonly_cols]
 
                 preferred_order = [
