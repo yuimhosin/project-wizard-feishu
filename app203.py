@@ -386,7 +386,28 @@ def save_to_db(df: pd.DataFrame):
     except Exception:
         url = ""
     if "/sheets/" in url and sync_sheets_full_replace is not None:
-        ok, msg = sync_sheets_full_replace(url, df)
+        df_sync = df
+        try:
+            # 关键修复：当前 URL 指向单个分表时，只回写该分表对应园区的数据，避免把多园区整表写进一个分表
+            m_sid = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", url)
+            sid = m_sid.group(1).strip() if m_sid else ""
+            sheet_name = ""
+            if sid:
+                meta = st.session_state.get("feishu_sheets_meta") or []
+                for x in meta:
+                    if str(x.get("sheet_id") or "").strip() == sid:
+                        sheet_name = str(x.get("sheet_name") or "").strip()
+                        break
+            # 兜底：优先使用当前步骤中已确定的园区
+            current_park = str(st.session_state.get("feishu_current_park") or "").strip()
+            target_park = current_park or sheet_name
+            if target_park and "园区" in df.columns:
+                sub = df[df["园区"].astype(str).str.strip() == target_park].copy()
+                if not sub.empty:
+                    df_sync = sub
+        except Exception:
+            df_sync = df
+        ok, msg = sync_sheets_full_replace(url, df_sync)
         try:
             if ok:
                 st.session_state["feishu_sync_last_ok"] = msg
@@ -5443,6 +5464,7 @@ def _render_project_wizard(df: pd.DataFrame):
             return
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
+        st.session_state["feishu_current_park"] = str(园区)
         # 关键修复：步骤1切换园区后，同步更新当前写回目标 sheet 链接，避免保存仍写到旧分表
         park_to_sheet_id = {}
         if st.session_state.get("feishu_sheets_meta"):
