@@ -283,6 +283,31 @@ def _normalize_timeline_value(v) -> str:
     s = str(v).strip() if v is not None else ""
     return "" if s.lower() in {"", "nan", "none", "null"} else s
 
+
+def _resolve_timeline_column(df: pd.DataFrame, chosen_col: str) -> str | None:
+    """
+    为时间节点选择最合适的目标列：
+    1) 精确命中
+    2) 模糊命中（如“验收(社区需求完成交付)”匹配“验收”）
+    """
+    if df is None or df.empty or not chosen_col:
+        return None
+    if chosen_col in df.columns:
+        return chosen_col
+    chosen = str(chosen_col).strip()
+    if not chosen:
+        return None
+    # 去括号做弱匹配
+    base = re.sub(r"[（(].*?[)）]", "", chosen).strip()
+    for c in df.columns:
+        cs = str(c).strip()
+        if not cs:
+            continue
+        cs_base = re.sub(r"[（(].*?[)）]", "", cs).strip()
+        if cs == chosen or cs_base == base or (base and base in cs):
+            return cs
+    return None
+
 # ---------- 团队共享数据：默认 SQLite，可与 elderly-dashboard 等共用 MySQL ----------
 # 优先级：APP203_DATABASE_URL > MYSQL_* 组合 > 本地 SQLite（APP203_DB_PATH）
 # 两仓库（elderly-dashboard / project-wizard-feishu）配置相同环境变量即可共用一张表。
@@ -5594,7 +5619,8 @@ def _render_project_wizard(df: pd.DataFrame):
 
         if chosen_timeline_col and chosen_timeline_col != "（不修改进度）":
             with st.form(f"edit_progress_form_{project_ctx}"):
-                raw_val = target_row.get(chosen_timeline_col, "")
+                target_timeline_col = _resolve_timeline_column(df_all, chosen_timeline_col) or chosen_timeline_col
+                raw_val = target_row.get(target_timeline_col, "")
                 existing_d = _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
                 new_date = st.date_input(
@@ -5609,12 +5635,20 @@ def _render_project_wizard(df: pd.DataFrame):
 
             if save_date_clicked:
                 df_new = df_all.copy()
-                if chosen_timeline_col in df_new.columns and row_id in df_new.index:
-                    df_new.loc[row_id, chosen_timeline_col] = _date_to_str(new_date)
+                target_timeline_col = _resolve_timeline_column(df_new, chosen_timeline_col) or chosen_timeline_col
+                # 若不存在匹配列，则新建标准列后写入
+                if target_timeline_col not in df_new.columns:
+                    df_new[target_timeline_col] = ""
+                if row_id in df_new.index:
+                    df_new.loc[row_id, target_timeline_col] = _date_to_str(new_date)
                 save_to_db(df_new)
                 if _get_feishu_webhook_url():
                     modified_row = df_new.loc[row_id]
-                    changes = [f"{chosen_timeline_col}：{_format_cell(target_row.get(chosen_timeline_col, '')) or '（空）'} → {_format_cell(modified_row.get(chosen_timeline_col, '')) or '（空）'}"]
+                    changes = [
+                        f"{chosen_timeline_col}："
+                        f"{_format_cell(target_row.get(target_timeline_col, '')) or '（空）'} → "
+                        f"{_format_cell(modified_row.get(target_timeline_col, '')) or '（空）'}"
+                    ]
                     modified_details = [{"序号": seq_val, "变更项": changes}]
                     diff = {
                         "deleted": [],
