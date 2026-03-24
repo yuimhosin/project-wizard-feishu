@@ -20,18 +20,13 @@ from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
     from feishu_bitable_loader import (
-        load_from_feishu,
-        sync_feishu_diff,
-        get_last_feishu_error,
-        FEISHU_RECORD_ID_COL,
+        load_from_bitable,
+        get_last_error as get_bitable_last_error,
+        list_sheets_from_sheets_url,
     )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
-    sync_feishu_diff = None  # type: ignore
-    load_from_feishu = None  # type: ignore
-    get_last_feishu_error = None  # type: ignore
-    FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 try:
     from feishu_oauth import build_authorize_url, exchange_code_for_user
@@ -74,6 +69,81 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+ROOT_DIR = Path(__file__).resolve().parent
+
+
+def _load_local_dotenv() -> None:
+    """本地开发：若存在项目根目录 .env，则加载（不覆盖已有环境变量）。"""
+    try:
+        from dotenv import load_dotenv
+
+        p = ROOT_DIR / ".env"
+        if p.exists():
+            load_dotenv(p, override=False)
+    except ImportError:
+        pass
+
+
+_load_local_dotenv()
+
+_DB_SECRETS_IN_ENV = False
+
+
+def _ensure_db_secrets_in_env() -> None:
+    """将 Streamlit secrets 中的数据库相关键写入 os.environ，供 SQLAlchemy 读取。"""
+    global _DB_SECRETS_IN_ENV
+    if _DB_SECRETS_IN_ENV:
+        return
+    _DB_SECRETS_IN_ENV = True
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for key in (
+                "APP203_DATABASE_URL",
+                "MYSQL_HOST",
+                "MYSQL_PORT",
+                "MYSQL_USER",
+                "MYSQL_PASSWORD",
+                "MYSQL_DATABASE",
+                "MYSQL_DB",
+                "APP203_DB_PATH",
+            ):
+                if str(os.environ.get(key, "")).strip():
+                    continue
+                try:
+                    if key in st.secrets:
+                        os.environ[key] = str(st.secrets[key])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+_FEISHU_SECRETS_IN_ENV = False
+
+
+def _ensure_feishu_secrets_in_env() -> None:
+    """将 Streamlit secrets 中的飞书相关键写入 os.environ，供飞书加载模块读取。"""
+    global _FEISHU_SECRETS_IN_ENV
+    if _FEISHU_SECRETS_IN_ENV:
+        return
+    _FEISHU_SECRETS_IN_ENV = True
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for key in (
+                "FEISHU_APP_ID",
+                "FEISHU_APP_SECRET",
+                "FEISHU_BITABLE_URL",
+            ):
+                if str(os.environ.get(key, "")).strip():
+                    continue
+                try:
+                    if key in st.secrets:
+                        os.environ[key] = str(st.secrets[key])
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
@@ -132,48 +202,6 @@ def _date_to_str(d) -> str:
 # ---------- 团队共享数据：默认 SQLite，可与 elderly-dashboard 等共用 MySQL ----------
 # 优先级：APP203_DATABASE_URL > MYSQL_* 组合 > 本地 SQLite（APP203_DB_PATH）
 # 两仓库（elderly-dashboard / project-wizard-feishu）配置相同环境变量即可共用一张表。
-DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
-
-# 默认数据源：飞书电子表格（可在 Secrets / 环境变量 FEISHU_TABLE_URL、FEISHU_BITABLE_URL 覆盖）
-DEFAULT_FEISHU_TABLE_URL = (
-    "https://tkhome.feishu.cn/sheets/WHpesgmsohOVpLtdokocXotsnfe?sheet=dAFcmN"
-)
-
-
-def _feishu_env_or_secret(key: str) -> str:
-    v = os.getenv(key, "").strip()
-    if v:
-        return v
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            val = st.secrets.get(key)
-            if val is not None and str(val).strip():
-                return str(val).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _feishu_table_url_from_secrets_or_env() -> str:
-    try:
-        if hasattr(st, "secrets") and st.secrets:
-            for k in ("FEISHU_TABLE_URL", "FEISHU_BITABLE_URL"):
-                try:
-                    v = st.secrets[k]
-                    if v and str(v).strip():
-                        return str(v).strip()
-                except (KeyError, TypeError, AttributeError):
-                    continue
-    except Exception:
-        pass
-    return (os.getenv("FEISHU_TABLE_URL") or os.getenv("FEISHU_BITABLE_URL") or "").strip()
-
-
-def _default_feishu_table_url() -> str:
-    v = _feishu_table_url_from_secrets_or_env()
-    if v:
-        return v
-    return DEFAULT_FEISHU_TABLE_URL
 
 
 def _sqlite_url_from_path(p: str) -> str:
@@ -184,6 +212,7 @@ def _sqlite_url_from_path(p: str) -> str:
 
 def _resolve_database_url() -> str:
     """解析数据库连接串：完整 URL 优先，其次 MYSQL_*，最后 SQLite。"""
+    _ensure_db_secrets_in_env()
     explicit = os.getenv("APP203_DATABASE_URL", "").strip()
     if explicit:
         return explicit
@@ -203,7 +232,8 @@ def _resolve_database_url() -> str:
                 f"mysql+pymysql://{safe_user}:{safe_pw}@{host}:{port}/{database}"
                 "?charset=utf8mb4"
             )
-    return _sqlite_url_from_path(DB_PATH)
+    db_path = os.getenv("APP203_DB_PATH", "app203_projects.db")
+    return _sqlite_url_from_path(db_path)
 
 
 @lru_cache(maxsize=1)
@@ -225,76 +255,14 @@ def load_from_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _get_feishu_sync_url() -> str | None:
-    """用于写回飞书的链接：优先 session，其次上次侧栏写入，再 Secrets/环境变量。"""
-    try:
-        u = st.session_state.get("feishu_bitable_url")
-        if u and str(u).strip():
-            return str(u).strip()
-    except Exception:
-        pass
-    last = (os.getenv("FEISHU_LAST_BITABLE_URL") or "").strip()
-    if last:
-        return last
-    fe = _feishu_table_url_from_secrets_or_env()
-    return fe or None
-
-
-def _remember_bitable_url_from_sidebar(bitable_url: str) -> None:
-    """每次渲染把输入框里的链接写入 session，避免未点「加载」时写回飞书因无 URL 被静默跳过。"""
-    s = (bitable_url or "").strip()
-    if not s:
-        try:
-            st.session_state.pop("feishu_bitable_url", None)
-        except Exception:
-            pass
-        return
-    try:
-        st.session_state["feishu_bitable_url"] = s
-        os.environ["FEISHU_LAST_BITABLE_URL"] = s
-    except Exception:
-        pass
-
-
-def save_to_db(df: pd.DataFrame, sync_feishu: bool = True):
-    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）；可选同步变更到飞书（多维表格或电子表格）。"""
+def save_to_db(df: pd.DataFrame):
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）。"""
     if df is None or df.empty:
         return
-    try:
-        df_old = load_from_db()
-    except Exception:
-        df_old = pd.DataFrame()
     engine = _get_db_engine()
+    # 用事务保证 replace 的一致性
     with engine.begin() as conn:
         df.to_sql("projects", conn, if_exists="replace", index=False)
-    if not sync_feishu or not FEISHU_BITABLE_AVAILABLE or sync_feishu_diff is None:
-        return
-    url = _get_feishu_sync_url()
-    if not url:
-        try:
-            st.session_state["feishu_sync_last_warn"] = (
-                "未检测到飞书表格链接（左侧输入框需填写完整链接）。修改仅保存在本地 SQLite，未同步到飞书。"
-            )
-        except Exception:
-            pass
-        return
-    try:
-        ok, msg, df_patched = sync_feishu_diff(url, df_old, df)
-        if ok and df_patched is not None:
-            save_to_db(df_patched, sync_feishu=False)
-        try:
-            if not ok:
-                st.session_state["feishu_sync_last_error"] = msg
-            else:
-                st.session_state["feishu_sync_last_error"] = ""
-                st.session_state["feishu_sync_last_ok"] = msg or "已同步到飞书。"
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            st.session_state["feishu_sync_last_error"] = str(e)
-        except Exception:
-            pass
 
 
 def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -636,7 +604,6 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     # 标签池：先选择需要分析的字段，再展示对应统计
     st.markdown("### 🔖 标签池（选择需要分析的字段）")
     all_tags = [
-        "社区（园区）",
         "所属区域",
         "所属业态",
         "项目分级",
@@ -646,12 +613,10 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         "专业",
         "专业分包",
         "项目名称",
-        "备注说明",
-        "实际预计金额",
     ]
     default_tags = st.session_state.get(
         "tag_pool_selection",
-        ["社区（园区）", "所属区域", "项目分级", "专业", "专业分包", "实际预计金额"],
+        ["所属区域", "项目分级", "专业", "专业分包"],
     )
     selected_tags = st.multiselect(
         "请选择本次分析要关注的字段（至少选择一个）：",
@@ -5280,14 +5245,60 @@ def _render_project_wizard(df: pd.DataFrame):
         # 注意：不要用「序号」去全表定位记录，因为序号可能在不同园区重复。
         # 这里统一用当前 DataFrame 的行索引作为行级 ID，确保选中哪条就编辑哪条。
         candidates = df_all.copy()
-        parks_list = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
-        parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
+        # 飞书 sheets：园区选项来自 sheets/query 的 sheet 名，避免仅加载单园区时选项被“锁死”
+        parks_list = []
+        if st.session_state.get("feishu_sheets_meta"):
+            meta = st.session_state.get("feishu_sheets_meta") or []
+            seen = set()
+            for x in meta:
+                name = str(x.get("sheet_name") or "").strip()
+                if name and name not in seen and name != "未知园区":
+                    seen.add(name)
+                    parks_list.append(name)
+        if not parks_list and "园区" in df_all.columns:
+            parks_list = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
+            parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
 
         if not parks_list:
             st.info("未发现任何园区数据，请先从飞书加载数据。")
             return
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
+        # 若当前 df_all 里尚未包含该园区（典型：首屏只加载一个 sheet），则按需拉取该园区数据
+        have_parks = set(map(str, df_all["园区"].dropna().astype(str).unique().tolist())) if "园区" in df_all.columns else set()
+        if st.session_state.get("feishu_sheets_meta") and "园区" in df_all.columns and str(园区) not in have_parks:
+            meta = st.session_state.get("feishu_sheets_meta") or []
+            park_to_sheet_id = {}
+            for x in meta:
+                name = str(x.get("sheet_name") or "").strip()
+                sid = str(x.get("sheet_id") or "").strip()
+                if name and sid and name not in park_to_sheet_id:
+                    park_to_sheet_id[name] = sid
+            sid = park_to_sheet_id.get(str(园区))
+            base_url = st.session_state.get("feishu_bitable_url") or ""
+            if sid and base_url:
+                cache = st.session_state.get("feishu_df_cache_by_sheet_id") or {}
+                if sid in cache and cache[sid] is not None and not cache[sid].empty:
+                    df_all = _ensure_project_columns(cache[sid])
+                else:
+                    import re
+
+                    if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
+                        url_sheet = re.sub(
+                            r"([?&]sheet=)[A-Za-z0-9_]+",
+                            lambda m: m.group(1) + sid,
+                            base_url,
+                        )
+                    else:
+                        join = "&" if "?" in base_url else "?"
+                        url_sheet = base_url + f"{join}sheet={sid}"
+                    df_one = load_from_bitable(url_sheet, load_all_sheets=False)
+                    if df_one is not None and not df_one.empty:
+                        cache[sid] = df_one
+                        st.session_state["feishu_df_cache_by_sheet_id"] = cache
+                        df_all = _ensure_project_columns(df_one)
+                candidates = df_all.copy()
+
         candidates = candidates[candidates["园区"].astype(str) == str(园区)].copy()
         if candidates.empty:
             st.info("该园区下未找到项目记录，请尝试更换园区。")
@@ -5451,10 +5462,10 @@ def _render_project_wizard(df: pd.DataFrame):
                 分包_opts = _get_dropdown_options(df_all, "专业分包") if "专业分包" in df_all.columns else []
 
                 # 平铺展示所有可修改项目信息（除日期列，且园区/区域/城市不可改）
-                readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证", FEISHU_RECORD_ID_COL}
+                readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
                 editable_cols = [c for c in df_all.columns if c not in set(TIMELINE_COLS)]
                 editable_cols = [str(c).strip() for c in editable_cols if str(c).strip() and str(c).strip().lower() not in {"nan", "none", "null"}]
-                editable_cols = [c for c in editable_cols if c not in readonly_cols and not str(c).startswith("__")]
+                editable_cols = [c for c in editable_cols if c not in readonly_cols]
 
                 preferred_order = [
                     "所属业态", "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
@@ -5727,14 +5738,6 @@ def main():
 
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
-    warn_msg = st.session_state.pop("feishu_sync_last_warn", None)
-    if warn_msg:
-        st.warning(warn_msg)
-    if st.session_state.get("feishu_sync_last_error"):
-        st.error(f"飞书写回失败：{st.session_state['feishu_sync_last_error']}")
-    ok_msg = st.session_state.pop("feishu_sync_last_ok", None)
-    if ok_msg:
-        st.success(ok_msg)
 
     # 侧边栏：用户信息 + 数据源
     with st.sidebar:
@@ -5746,53 +5749,81 @@ def main():
                 del st.session_state["feishu_user"]
                 st.rerun()
         st.header("数据源")
-        st.caption(
-            "支持飞书多维表格（Bitable）与电子表格（Sheets）。加载后写入 SQLite 缓存；"
-            "在向导中保存时会尝试写回飞书（需左侧链接且应用具备相应权限）。"
-            "电子表格示例：…/sheets/{表格token}?sheet={子表id}；多维表格：…/base/… 或 wiki 且含 ?table=表id。"
-        )
+        st.caption("仅支持从飞书多维表格加载；加载后写入本地缓存（SQLite），向导中的修改会保存到该缓存。")
+
+        _ensure_feishu_secrets_in_env()
+        feishu_app_id = str(os.getenv("FEISHU_APP_ID", "")).strip()
+        feishu_app_secret = str(os.getenv("FEISHU_APP_SECRET", "")).strip()
 
         if not FEISHU_BITABLE_AVAILABLE:
             st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
-        elif not _feishu_env_or_secret("FEISHU_APP_ID") or not _feishu_env_or_secret("FEISHU_APP_SECRET"):
+        elif not feishu_app_id or not feishu_app_secret:
             st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
         else:
             bitable_url = st.text_input(
-                "飞书表格链接",
-                value=_default_feishu_table_url(),
-                placeholder="https://xxx.feishu.cn/sheets/...?sheet=... 或 base/wiki 多维表格链接",
+                "飞书多维表格链接",
+                value=str(os.getenv(
+                    "FEISHU_BITABLE_URL",
+                    "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
+                )).strip(),
+                placeholder="支持 sheets/base/wiki 链接；wiki/base 建议带 ?table=TableId",
             )
-            _remember_bitable_url_from_sidebar(bitable_url)
+            load_all_sheets = st.checkbox("读取全部园区（较慢）", value=False, key="load_all_sheets_feishu")
+
             if st.button("🔄 从飞书加载", key="load_feishu"):
                 if not (bitable_url or "").strip():
-                    st.warning(
-                        "请先填写飞书表格链接，或在 Secrets 中配置 FEISHU_TABLE_URL / FEISHU_BITABLE_URL。"
-                    )
+                    st.warning("请先填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
                 else:
-                    with st.spinner("正在从飞书加载..."):
-                        loaded = load_from_feishu(bitable_url.strip())
-                    if loaded.empty:
-                        detail = ""
+                    import re
+
+                    sheets_meta = []
+                    sheet_names = []
+                    if "/sheets/" in bitable_url:
                         try:
-                            if get_last_feishu_error is not None:
-                                detail = (get_last_feishu_error() or "").strip()
+                            sheets_meta = list_sheets_from_sheets_url(bitable_url.strip())
                         except Exception:
-                            detail = ""
-                        st.warning(
-                            "未获取到数据，请检查链接和权限（应用需具备该电子表格/多维表格的读取权限）。"
-                        )
-                        if detail:
-                            st.error(f"飞书返回详情：{detail}")
+                            sheets_meta = []
+                        sheet_names = [x.get("sheet_name", "") for x in sheets_meta if x.get("sheet_name")]
+                        st.caption(f"飞书 sheets/query 结构读取：{len(sheet_names)} 个园区（sheet 名）")
+                        st.session_state["feishu_sheet_names"] = sheet_names
+                        st.session_state["feishu_sheets_meta"] = sheets_meta
+                    st.session_state["feishu_bitable_url"] = bitable_url.strip()
+                    if "feishu_df_cache_by_sheet_id" not in st.session_state:
+                        st.session_state["feishu_df_cache_by_sheet_id"] = {}
+                    if load_all_sheets:
+                        st.session_state["feishu_default_parks"] = sheet_names
                     else:
-                        st.session_state["feishu_bitable_url"] = bitable_url.strip()
-                        os.environ["FEISHU_LAST_BITABLE_URL"] = bitable_url.strip()
-                        save_to_db(loaded, sync_feishu=False)
+                        m = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", bitable_url.strip())
+                        target_sid = m.group(1) if m else ""
+                        default_name = ""
+                        if target_sid and sheets_meta:
+                            for x in sheets_meta:
+                                if str(x.get("sheet_id") or "").strip() == str(target_sid).strip():
+                                    default_name = str(x.get("sheet_name") or "").strip()
+                                    break
+                        if not default_name and sheets_meta:
+                            default_name = str(sheets_meta[0].get("sheet_name") or "").strip()
+                        st.session_state["feishu_default_parks"] = [default_name] if default_name else []
+
+                    with st.spinner("正在从飞书加载..."):
+                        loaded = load_from_bitable(
+                            bitable_url.strip(),
+                            load_all_sheets=load_all_sheets,
+                        )
+                    if loaded.empty:
+                        st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
+                        try:
+                            err = get_bitable_last_error()
+                            if err:
+                                st.caption(f"飞书接口诊断：{err}")
+                        except Exception:
+                            pass
+                    else:
+                        save_to_db(loaded)
                         msg = f"已从飞书加载并写入本地缓存，共 {len(loaded)} 条记录。"
                         if _get_feishu_webhook_url():
                             try:
-                                if push_to_feishu(
-                                    f"【养老社区进度表】已从飞书导入，共 {len(loaded)} 条记录。"
-                                ):
+                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(loaded)} 条记录。"):
                                     st.success(msg + " 已推送通知至飞书。")
                                 else:
                                     st.success(msg)
@@ -5809,19 +5840,97 @@ def main():
             st.caption(f"当前数据：共 {len(df)} 条。点击「从飞书加载」可从飞书刷新并覆盖本地缓存。")
 
         if not df.empty:
-            parks = df["园区"].dropna().unique().tolist()
-            parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
-            if parks:
-                园区选择 = st.multiselect("筛选园区", options=parks, default=parks)
+            park_col = None
+            if "园区" in df.columns:
+                park_col = "园区"
+            elif "社区" in df.columns:
+                park_col = "社区"
+            if park_col:
+                # 若当前使用飞书 sheets：先用 sheets/query 的结构生成园区下拉（不依赖当前已加载的数据行）。
+                if st.session_state.get("feishu_sheet_names"):
+                    options = st.session_state.get("feishu_sheet_names") or []
+                    default_parks = st.session_state.get("feishu_default_parks") or []
+                    # 兜底：若默认空，则用当前 df 中实际存在的园区
+                    if not default_parks:
+                        parks = df[park_col].dropna().unique().tolist()
+                        parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
+                        default_parks = parks
+                    园区选择 = st.multiselect(
+                        "筛选园区",
+                        options=options,
+                        default=default_parks,
+                        key="park_filter_multiselect",
+                    )
+                else:
+                    parks = df[park_col].dropna().unique().tolist()
+                    parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
+                    if parks:
+                        园区选择 = st.multiselect("筛选园区", options=parks, default=parks)
+                    else:
+                        园区选择 = []
             else:
+                st.info("当前数据未识别到「园区/社区」列，先按全部数据展示。")
                 园区选择 = []
         else:
             园区选择 = []
 
     if df.empty:
-        st.warning("请先在侧边栏填写飞书表格链接并点击「从飞书加载」。")
+        st.warning("请先在侧边栏填写飞书多维表格链接并点击「从飞书加载」。")
         render_审核流程说明()
         return
+
+    # 飞书 sheets：按需补齐所选园区的数据（避免首屏全量拉取过慢）
+    if (
+        st.session_state.get("feishu_sheets_meta")
+        and 园区选择
+        and not df.empty
+        and "园区" in df.columns
+    ):
+        meta = st.session_state.get("feishu_sheets_meta") or []
+        park_to_sheet_id = {}
+        for x in meta:
+            name = str(x.get("sheet_name") or "").strip()
+            sid = str(x.get("sheet_id") or "").strip()
+            if name and sid and name not in park_to_sheet_id:
+                park_to_sheet_id[name] = sid
+
+        have_parks = set(map(str, df["园区"].dropna().astype(str).unique().tolist()))
+        missing_parks = [p for p in 园区选择 if p and str(p).strip() and str(p) not in have_parks]
+        if missing_parks:
+            loaded_additions = []
+            cache = st.session_state.get("feishu_df_cache_by_sheet_id") or {}
+            base_url = st.session_state.get("feishu_bitable_url") or ""
+            if base_url:
+                import re
+
+                for p in missing_parks:
+                    sid = park_to_sheet_id.get(p)
+                    if not sid:
+                        continue
+                    if sid in cache and cache[sid] is not None and not cache[sid].empty:
+                        loaded_additions.append(cache[sid])
+                        continue
+
+                    # 替换 URL 中的 sheet 参数，实现“只加载某一个园区”
+                    if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
+                        url_sheet = re.sub(
+                            r"([?&]sheet=)[A-Za-z0-9_]+",
+                            lambda m: m.group(1) + sid,
+                            base_url,
+                        )
+                    else:
+                        join = "&" if "?" in base_url else "?"
+                        url_sheet = base_url + f"{join}sheet={sid}"
+
+                    df_one = load_from_bitable(url_sheet, load_all_sheets=False)
+                    if df_one is not None and not df_one.empty:
+                        cache[sid] = df_one
+                        loaded_additions.append(df_one)
+
+                st.session_state["feishu_df_cache_by_sheet_id"] = cache
+                if loaded_additions:
+                    df = pd.concat([df] + loaded_additions, ignore_index=True)
+                    st.caption(f"已按需补齐园区数据：{missing_parks}（新增 {sum(len(x) for x in loaded_additions)} 行）")
 
     # 列名/列顺序规范化，再补齐关键列
     df = _canonicalize_df(df)

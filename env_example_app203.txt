@@ -24,14 +24,19 @@ FEISHU_REDIRECT_URI=http://localhost:8501/
 #    格式：https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=APPID&redirect_uri=ENCODED_REDIRECT_URI&scope=contact:user.base:readonly&state=default
 #    redirect_uri 需 URL 编码，如 http%3A%2F%2Flocalhost%3A8501%2F
 
-# ---------- 与 elderly-dashboard 共用的 MySQL（任选一种配置方式）----------
-# 方式 A：完整连接串（可与 Postgres 等混用）
+# ---------- 与 elderly-dashboard-main 共用同一 MySQL（两项目填同一套变量）----------
+# 优先级：APP203_DATABASE_URL > MYSQL_* > APP203_DB_PATH(SQLite)
+# 若要两应用读写同一张 projects 表：请使用「完全相同」的 APP203_DATABASE_URL（或完全相同的 MYSQL_* 组合）。
+#
+# 方式 A：完整连接串（推荐，两处复制粘贴同一行）
 # APP203_DATABASE_URL=mysql+pymysql://用户:密码@主机:3306/数据库名?charset=utf8mb4
-
-# 方式 B：分项变量（推荐在 Streamlit Secrets 里与另一仓库填相同值）
+#
+# 方式 B：分项变量（两项目 Secrets / .env 里逐项填相同值）
 # MYSQL_HOST=xxx.rds.aliyuncs.com
 # MYSQL_PORT=3306
 # MYSQL_USER=app_user
 # MYSQL_PASSWORD=your_password
 # MYSQL_DATABASE=elderly_projects
-# 未配置 MySQL 时仍使用本地 SQLite：APP203_DB_PATH=app203_projects.db
+#
+# 未配置 MySQL 时仍使用本地 SQLite：
+# APP203_DB_PATH=app203_projects.db
