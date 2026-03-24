@@ -5613,11 +5613,13 @@ def _render_project_wizard(df: pd.DataFrame):
                 df_new = df_all.copy()
                 if row_id in df_new.index:
                     df_new = df_new.drop(index=row_id)
-                save_to_db(df_new)
+                with st.spinner("正在保存删除结果并同步飞书..."):
+                    save_to_db(df_new)
                 if _get_feishu_webhook_url():
                     diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
                     payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
                     push_to_feishu(payload=payload)
+                st.session_state["ui_save_last_ok"] = "删除成功，数据已保存。"
                 st.success(f"已删除项目（园区：{园区}，序号：{seq_val or '未知'}）。")
                 st.rerun()
 
@@ -5649,7 +5651,8 @@ def _render_project_wizard(df: pd.DataFrame):
                     df_new[target_timeline_col] = ""
                 if row_id in df_new.index:
                     df_new.loc[row_id, target_timeline_col] = _date_to_str(new_date)
-                save_to_db(df_new)
+                with st.spinner("正在保存进度并同步飞书..."):
+                    save_to_db(df_new)
                 if _get_feishu_webhook_url():
                     modified_row = df_new.loc[row_id]
                     changes = [
@@ -5666,6 +5669,7 @@ def _render_project_wizard(df: pd.DataFrame):
                     }
                     payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-进度")
                     push_to_feishu(payload=payload)
+                st.session_state["ui_save_last_ok"] = "进度修改已保存。"
                 st.success("已保存进度更改。")
                 st.rerun()
 
@@ -5776,7 +5780,8 @@ def _render_project_wizard(df: pd.DataFrame):
                         if "城市" in df_new.columns:
                             df_new.loc[row_id, "城市"] = matched_city or df_new.loc[row_id, "城市"]
 
-                    save_to_db(df_new)
+                    with st.spinner("正在保存项目信息并同步飞书..."):
+                        save_to_db(df_new)
                     if _get_feishu_webhook_url():
                         modified_row = df_new.loc[row_id]
                         changes = []
@@ -5796,6 +5801,7 @@ def _render_project_wizard(df: pd.DataFrame):
                         }
                         payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-信息")
                         push_to_feishu(payload=payload)
+                    st.session_state["ui_save_last_ok"] = "项目信息修改已保存。"
                     st.success("已保存项目信息更改。")
                     st.rerun()
         return
@@ -5926,11 +5932,13 @@ def _render_project_wizard(df: pd.DataFrame):
 
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
-        save_to_db(df_all2)
+        with st.spinner("正在保存新增项目并同步飞书..."):
+            save_to_db(df_all2)
         if _get_feishu_webhook_url():
             diff = {"deleted": [], "added": [_row_to_dict(df_new_row.iloc[0])], "modified": []}
             payload = _build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
             push_to_feishu(payload=payload)
+        st.session_state["ui_save_last_ok"] = "新增项目已保存。"
         st.success(f"已写入数据库。上传凭证：{token}")
         st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
         st.rerun()
@@ -5986,6 +5994,9 @@ def main():
     ok_msg = st.session_state.pop("feishu_sync_last_ok", None)
     if ok_msg:
         st.success(ok_msg)
+    ui_ok = st.session_state.pop("ui_save_last_ok", None)
+    if ui_ok:
+        st.success(ui_ok)
 
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
