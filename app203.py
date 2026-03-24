@@ -33,6 +33,11 @@ except ImportError:
 
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
 PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if str(x).strip()])
+EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
+
+
+def _is_excluded_sheet_name(name: str) -> bool:
+    return str(name or "").strip() in EXCLUDED_SHEET_NAMES
 
 try:
     from feishu_oauth import build_authorize_url, exchange_code_for_user
@@ -5391,6 +5396,8 @@ def _render_project_wizard(df: pd.DataFrame):
             seen = set()
             for x in meta:
                 name = str(x.get("sheet_name") or "").strip()
+                if _is_excluded_sheet_name(name):
+                    continue
                 if name and name not in seen and name != "未知园区":
                     seen.add(name)
                     parks_list.append(name)
@@ -5410,6 +5417,8 @@ def _render_project_wizard(df: pd.DataFrame):
             for x in meta:
                 name = str(x.get("sheet_name") or "").strip()
                 sid = str(x.get("sheet_id") or "").strip()
+                if _is_excluded_sheet_name(name):
+                    continue
                 if name and sid and name not in park_to_sheet_id:
                     park_to_sheet_id[name] = sid
             sid_selected = park_to_sheet_id.get(str(园区))
@@ -5523,6 +5532,12 @@ def _render_project_wizard(df: pd.DataFrame):
         chosen_label = st.selectbox("项目名称*（下拉选择）", options=name_options, index=0, key="edit_name_select")
         row_id = int(name_to_rowid[chosen_label])
         target_row = df_all.loc[row_id]
+        project_ctx = f"{园区}|{row_id}|{chosen_label}"
+        if st.session_state.get("project_edit_ctx") != project_ctx:
+            # 切换项目时重置编辑区关键状态，避免沿用上一个项目的控件状态
+            st.session_state["project_edit_ctx"] = project_ctx
+            st.session_state.pop(f"enable_info_edit_{project_ctx}", None)
+            st.session_state.pop(f"edit_progress_menu_{project_ctx}", None)
 
         # 选中项目详情展示（不再显示园区列表）
         st.markdown("---")
@@ -5558,7 +5573,7 @@ def _render_project_wizard(df: pd.DataFrame):
             seq_val = 0
 
         with st.expander("危险操作：删除该项目", expanded=False):
-            with st.form(f"delete_project_form_{row_id}"):
+            with st.form(f"delete_project_form_{project_ctx}"):
                 st.warning("删除后将从团队共享数据库中移除该条记录，且不可恢复（除非重新导入原始数据）。")
                 delete_clicked = st.form_submit_button("🗑 删除该项目", type="primary")
             if delete_clicked:
@@ -5575,10 +5590,10 @@ def _render_project_wizard(df: pd.DataFrame):
 
         st.markdown("#### 更改项目进度")
         timeline_opts = ["（不修改进度）"] + list(TIMELINE_COLS)
-        chosen_timeline_col = st.selectbox("选择要更新的进度节点", options=timeline_opts, index=0, key=f"edit_progress_menu_{row_id}")
+        chosen_timeline_col = st.selectbox("选择要更新的进度节点", options=timeline_opts, index=0, key=f"edit_progress_menu_{project_ctx}")
 
         if chosen_timeline_col and chosen_timeline_col != "（不修改进度）":
-            with st.form(f"edit_progress_form_{row_id}"):
+            with st.form(f"edit_progress_form_{project_ctx}"):
                 raw_val = target_row.get(chosen_timeline_col, "")
                 existing_d = _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
@@ -5588,7 +5603,7 @@ def _render_project_wizard(df: pd.DataFrame):
                     min_value=DATE_RANGE_MIN,
                     max_value=DATE_RANGE_MAX,
                     format="YYYY-MM-DD",
-                    key=f"edit_progress_date_{row_id}_{chosen_timeline_col}",
+                    key=f"edit_progress_date_{project_ctx}_{chosen_timeline_col}",
                 )
                 save_date_clicked = st.form_submit_button("💾 保存进度更改")
 
@@ -5620,13 +5635,13 @@ def _render_project_wizard(df: pd.DataFrame):
         matched_region = 园区_TO_区域.get(current_park, str(target_row.get("所属区域", "") or "").strip())
         matched_city = 园区_TO_城市.get(current_park, str(target_row.get("城市", "") or "").strip())
 
-        st.text_input("园区（只读）", value=current_park, disabled=True, key=f"ro_park_{row_id}")
-        st.text_input("所属区域（自动匹配，只读）", value=str(matched_region or ""), disabled=True, key=f"ro_region_{row_id}")
-        st.text_input("城市（自动匹配，只读）", value=str(matched_city or ""), disabled=True, key=f"ro_city_{row_id}")
+        st.text_input("园区（只读）", value=current_park, disabled=True, key=f"ro_park_{project_ctx}")
+        st.text_input("所属区域（自动匹配，只读）", value=str(matched_region or ""), disabled=True, key=f"ro_region_{project_ctx}")
+        st.text_input("城市（自动匹配，只读）", value=str(matched_city or ""), disabled=True, key=f"ro_city_{project_ctx}")
 
-        enable_info_edit = st.checkbox("启用项目信息修改", value=False, key=f"enable_info_edit_{row_id}")
+        enable_info_edit = st.checkbox("启用项目信息修改", value=False, key=f"enable_info_edit_{project_ctx}")
         if enable_info_edit:
-            with st.form(f"edit_info_form_{row_id}"):
+            with st.form(f"edit_info_form_{project_ctx}"):
                 updates = {}
 
                 # 下拉选项准备
@@ -5661,32 +5676,32 @@ def _render_project_wizard(df: pd.DataFrame):
                         current_val = target_row.get(col, "")
                         if col == "所属业态" and 业态_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 业态_opts, index=(业态_opts.index(v) + 1) if v in 业态_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 业态_opts, index=(业态_opts.index(v) + 1) if v in 业态_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "项目分级" and 分级_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 分级_opts, index=(分级_opts.index(v) + 1) if v in 分级_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 分级_opts, index=(分级_opts.index(v) + 1) if v in 分级_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "项目分类" and 分类_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 分类_opts, index=(分类_opts.index(v) + 1) if v in 分类_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 分类_opts, index=(分类_opts.index(v) + 1) if v in 分类_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "拟定承建组织" and 承建_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 承建_opts, index=(承建_opts.index(v) + 1) if v in 承建_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 承建_opts, index=(承建_opts.index(v) + 1) if v in 承建_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "总部重点关注项目" and 总部_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 总部_opts, index=(总部_opts.index(v) + 1) if v in 总部_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 总部_opts, index=(总部_opts.index(v) + 1) if v in 总部_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "专业" and 专业_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 专业_opts, index=(专业_opts.index(v) + 1) if v in 专业_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 专业_opts, index=(专业_opts.index(v) + 1) if v in 专业_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "专业分包" and 分包_opts:
                             v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 分包_opts, index=(分包_opts.index(v) + 1) if v in 分包_opts else 0, key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.selectbox(col, options=[""] + 分包_opts, index=(分包_opts.index(v) + 1) if v in 分包_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "实际预计金额":
                             try:
-                                updates[col] = st.number_input(col, min_value=0.0, value=float(current_val or 0.0), step=1.0, key=f"edit_info_{row_id}_{col}")
+                                updates[col] = st.number_input(col, min_value=0.0, value=float(current_val or 0.0), step=1.0, key=f"edit_info_{project_ctx}_{col}")
                             except Exception:
-                                updates[col] = st.number_input(col, min_value=0.0, value=0.0, step=1.0, key=f"edit_info_{row_id}_{col}")
+                                updates[col] = st.number_input(col, min_value=0.0, value=0.0, step=1.0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "备注说明":
-                            updates[col] = st.text_area(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
+                            updates[col] = st.text_area(col, value=str(current_val or ""), key=f"edit_info_{project_ctx}_{col}")
                         else:
                             dyn_opts = _guess_single_select_options(df_all, col)
                             if dyn_opts:
@@ -5695,10 +5710,10 @@ def _render_project_wizard(df: pd.DataFrame):
                                     col,
                                     options=[""] + dyn_opts,
                                     index=(dyn_opts.index(v) + 1) if v in dyn_opts else 0,
-                                    key=f"edit_info_{row_id}_{col}",
+                                    key=f"edit_info_{project_ctx}_{col}",
                                 )
                             else:
-                                updates[col] = st.text_input(col, value=str(current_val or ""), key=f"edit_info_{row_id}_{col}")
+                                updates[col] = st.text_input(col, value=str(current_val or ""), key=f"edit_info_{project_ctx}_{col}")
 
                 save_info_clicked = st.form_submit_button("💾 保存项目信息更改")
 
@@ -6028,7 +6043,14 @@ def main():
             try:
                 base_url = st.session_state.get("feishu_bitable_url") or ""
                 if "/sheets/" in str(base_url):
-                    st.session_state["feishu_sheets_meta"] = list_sheets_from_sheets_url(str(base_url).strip())
+                    raw_meta = list_sheets_from_sheets_url(str(base_url).strip())
+                    filtered_meta = []
+                    for x in (raw_meta or []):
+                        name = str(x.get("sheet_name") or "").strip()
+                        if _is_excluded_sheet_name(name):
+                            continue
+                        filtered_meta.append(x)
+                    st.session_state["feishu_sheets_meta"] = filtered_meta
             except Exception:
                 st.session_state["feishu_sheets_meta"] = []
 
@@ -6041,6 +6063,8 @@ def main():
         for x in meta:
             name = str(x.get("sheet_name") or "").strip()
             sid = str(x.get("sheet_id") or "").strip()
+            if _is_excluded_sheet_name(name):
+                continue
             if name and sid and name not in park_to_sheet_id:
                 park_to_sheet_id[name] = sid
 

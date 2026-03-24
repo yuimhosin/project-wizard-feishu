@@ -15,6 +15,7 @@ FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
 _last_error = ""
 FEISHU_RECORD_ID_COL = "__feishu_record_id"
+EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
 
 
 def _set_last_error(msg: str):
@@ -24,6 +25,10 @@ def _set_last_error(msg: str):
 
 def get_last_error() -> str:
     return _last_error
+
+
+def _is_excluded_sheet_name(name: str) -> bool:
+    return str(name or "").strip() in EXCLUDED_SHEET_NAMES
 
 
 def _format_http_error(e: Exception) -> str:
@@ -163,6 +168,8 @@ def list_sheets_from_sheets_url(url_or_id: str) -> list[dict]:
                 or ""
             )
             name = str(name).strip() if name is not None else ""
+            if _is_excluded_sheet_name(name):
+                continue
             out.append({"sheet_id": sid, "sheet_name": name})
 
         _set_last_error("")
