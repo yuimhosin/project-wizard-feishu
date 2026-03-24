@@ -497,29 +497,32 @@ def _normalize_sheets_df(df: pd.DataFrame) -> pd.DataFrame:
         out = out.iloc[1:].reset_index(drop=True)
 
     # 删除全空列
-    keep_cols = []
-    for c in out.columns:
-        s = out[c].astype(str).str.strip()
+    keep_idx = []
+    for idx, c in enumerate(out.columns):
+        # 用 iloc 按位置取列，避免重复列名时 out[c] 变成 DataFrame
+        s = out.iloc[:, idx].astype(str).str.strip()
         if (s != "").any() and (~s.str.lower().eq("nan")).any():
-            keep_cols.append(c)
-    if keep_cols:
-        out = out[keep_cols].copy()
+            keep_idx.append(idx)
+    if keep_idx:
+        out = out.iloc[:, keep_idx].copy()
 
     # 删除占位列（列11/列12...）：结构不统一时常出现，且大多为空
     try:
-        drop_placeholder = []
-        for c in out.columns:
+        drop_placeholder_idx = []
+        for idx, c in enumerate(out.columns):
             name = str(c).strip()
             if not re.fullmatch(r"列\d+", name):
                 continue
-            s = out[c].astype(str).str.strip().str.lower()
+            # 用 iloc 按位置取列，避免重复列名冲突
+            s = out.iloc[:, idx].astype(str).str.strip().str.lower()
             non_empty = (~s.isin(["", "nan", "none", "null"])).sum()
             ratio = float(non_empty) / max(len(out), 1)
             # 占位列只有极少量有效值时直接丢弃，避免污染编辑表单
             if ratio <= 0.1:
-                drop_placeholder.append(c)
-        if drop_placeholder:
-            out = out.drop(columns=drop_placeholder, errors="ignore")
+                drop_placeholder_idx.append(idx)
+        if drop_placeholder_idx:
+            keep_after = [i for i in range(out.shape[1]) if i not in set(drop_placeholder_idx)]
+            out = out.iloc[:, keep_after].copy()
     except Exception:
         pass
 

@@ -312,21 +312,22 @@ def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     """去掉列名为空字符串的列，避免 data_editor 因重复空列名报错。"""
-    keep_cols = [c for c in df.columns if str(c).strip() != ""]
-    out = df[keep_cols].copy()
+    keep_idx = [i for i, c in enumerate(df.columns) if str(c).strip() != ""]
+    out = df.iloc[:, keep_idx].copy()
     # 过滤掉结构不统一带来的占位列（列11/列12...）与内部列，避免界面出现大量空输入框
-    out_cols = []
-    for c in out.columns:
+    out_idx = []
+    for i, c in enumerate(out.columns):
         cs = str(c).strip()
         if cs.startswith("__"):
             continue
         if re.fullmatch(r"列\d+", cs):
-            s = out[c].astype(str).str.strip().str.lower()
+            # 按位置取列，规避重复列名时 out[c] 返回 DataFrame
+            s = out.iloc[:, i].astype(str).str.strip().str.lower()
             non_empty = (~s.isin(["", "nan", "none", "null"])).sum()
             if float(non_empty) / max(len(out), 1) <= 0.1:
                 continue
-        out_cols.append(c)
-    return out[out_cols].copy()
+        out_idx.append(i)
+    return out.iloc[:, out_idx].copy()
 
 
 def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
