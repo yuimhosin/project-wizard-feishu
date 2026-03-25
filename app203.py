@@ -20,6 +20,13 @@ from data_loader import get_稳定需求_mask, TIMELINE_COLS, TIMELINE_COL_MAP
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
+    from streamlit_dateinput_intl import streamlit_dateinput_intl as _dateinput_intl  # type: ignore
+    _DATEINPUT_INTL_AVAILABLE = True
+except Exception:
+    _dateinput_intl = None  # type: ignore
+    _DATEINPUT_INTL_AVAILABLE = False
+
+try:
     from feishu_bitable_loader import (
         load_from_bitable,
         get_last_error as get_bitable_last_error,
@@ -359,6 +366,46 @@ def _date_to_str(d) -> str:
     if isinstance(d, date):
         return d.strftime("%Y-%m-%d")
     return str(d) if d else ""
+
+
+def _date_input_cn(
+    label: str,
+    *,
+    value: date,
+    min_value: date,
+    max_value: date,
+    key: str,
+) -> date:
+    """
+    日期选择器（中文月份/星期）：
+    - 若安装了 streamlit-dateinput-intl，则用其 locale=zh-cn
+    - 否则回退到 st.date_input
+    """
+    if _DATEINPUT_INTL_AVAILABLE and _dateinput_intl is not None:
+        try:
+            v = _dateinput_intl(
+                value=value,
+                min=min_value,
+                max=max_value,
+                key=key,
+                format="YYYY-MM-DD",
+                locale="zh-cn",
+                width="stretch",
+            )
+            if isinstance(v, date):
+                return v
+            d = _str_to_date(v)
+            return d if d != SENTINEL_DATE else value
+        except Exception:
+            pass
+    return st.date_input(
+        label,
+        value=value,
+        min_value=min_value,
+        max_value=max_value,
+        format="YYYY-MM-DD",
+        key=key,
+    )
 
 
 def _normalize_timeline_value(v) -> str:
@@ -6009,12 +6056,11 @@ def _render_project_wizard(df: pd.DataFrame):
                     _date_ui_title = f"「{_tl_label}」（{chosen_timeline_col}）"
                 else:
                     _date_ui_title = f"「{_tl_label}」"
-                new_date = st.date_input(
+                new_date = _date_input_cn(
                     f"{_date_ui_title} 日期",
                     value=default_d,
                     min_value=DATE_RANGE_MIN,
                     max_value=DATE_RANGE_MAX,
-                    format="YYYY-MM-DD",
                     key=f"edit_progress_date_{project_ctx}_{chosen_timeline_col}",
                 )
                 save_date_clicked = st.form_submit_button("💾 保存进度更改")
@@ -6316,12 +6362,11 @@ def _render_project_wizard(df: pd.DataFrame):
         for col in add_timeline_cols:
             use_this = st.checkbox(f"填写 {col} 日期", value=False, key=f"add_timeline_use_{col}")
             if use_this:
-                dval = st.date_input(
+                dval = _date_input_cn(
                     col,
                     value=date(2026, 1, 1),
                     min_value=DATE_RANGE_MIN,
                     max_value=DATE_RANGE_MAX,
-                    format="YYYY-MM-DD",
                     key=f"add_timeline_date_{col}",
                 )
                 timeline_values[col] = _date_to_str(dval)
