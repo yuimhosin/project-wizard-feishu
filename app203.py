@@ -49,6 +49,41 @@ TIMELINE_ALIAS_MAP = {
 }
 
 
+@lru_cache(maxsize=1)
+def _all_timeline_column_names() -> frozenset:
+    """标准节点、飞书原表头、燕园阶段别名等：一律在「更改项目进度」里用日期编辑，不出现在项目信息文本框。"""
+    names: set[str] = set()
+    for c in TIMELINE_COLS:
+        if c and str(c).strip():
+            names.add(str(c).strip())
+    for k, v in TIMELINE_COL_MAP.items():
+        if k and str(k).strip():
+            names.add(str(k).strip())
+        if v and str(v).strip():
+            names.add(str(v).strip())
+    for std, aliases in TIMELINE_ALIAS_MAP.items():
+        if std and str(std).strip():
+            names.add(str(std).strip())
+        for a in aliases or []:
+            if a and str(a).strip():
+                names.add(str(a).strip())
+    return frozenset(names)
+
+
+def _norm_sheet_header_paren(s: str) -> str:
+    return str(s or "").strip().replace("（", "(").replace("）", ")")
+
+
+def _is_structural_sheet_header_col(col: str) -> bool:
+    """双层表头中的分类行（如「预计节点（月份）」），不是业务数据列。"""
+    s = _norm_sheet_header_paren(col)
+    if not s:
+        return True
+    if s == "预计节点(月份)":
+        return True
+    return False
+
+
 def _is_excluded_sheet_name(name: str) -> bool:
     return str(name or "").strip() in EXCLUDED_SHEET_NAMES
 
@@ -5660,6 +5695,8 @@ def _render_project_wizard(df: pd.DataFrame):
                     continue
                 if ks.lower() in {"nan", "none", "null"}:
                     continue
+                if _is_structural_sheet_header_col(ks):
+                    continue
                 show_items.append({"字段": ks, "值": _format_cell(v)})
             if show_items:
                 st.dataframe(pd.DataFrame(show_items), use_container_width=True, hide_index=True)
@@ -5703,8 +5740,14 @@ def _render_project_wizard(df: pd.DataFrame):
                 raw_val = target_row.get(target_timeline_col, "")
                 existing_d = _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
+                # 标签优先用飞书实际列名（如「验收(社区需求完成交付)」），便于与表格表头一致
+                _tl_label = str(target_timeline_col).strip() if target_timeline_col else chosen_timeline_col
+                if _tl_label != str(chosen_timeline_col).strip():
+                    _date_ui_title = f"「{_tl_label}」（{chosen_timeline_col}）"
+                else:
+                    _date_ui_title = f"「{_tl_label}」"
                 new_date = st.date_input(
-                    f"「{chosen_timeline_col}」日期",
+                    f"{_date_ui_title} 日期",
                     value=default_d,
                     min_value=DATE_RANGE_MIN,
                     max_value=DATE_RANGE_MAX,
@@ -5769,9 +5812,14 @@ def _render_project_wizard(df: pd.DataFrame):
                 专业_opts = _get_dropdown_options(df_all, "专业", 专业大类) if "专业" in df_all.columns else []
                 分包_opts = _get_dropdown_options(df_all, "专业分包") if "专业分包" in df_all.columns else []
 
-                # 平铺展示所有可修改项目信息（除日期列，且园区/区域/城市不可改）
+                # 平铺展示所有可修改项目信息（节点日期仅在「更改项目进度」编辑；表头分类如「预计节点（月份）」排除）
                 readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
-                editable_cols = [c for c in df_all.columns if c not in set(TIMELINE_COLS)]
+                _tnames = _all_timeline_column_names()
+                editable_cols = [
+                    c
+                    for c in df_all.columns
+                    if str(c).strip() not in _tnames and not _is_structural_sheet_header_col(str(c))
+                ]
                 editable_cols = [str(c).strip() for c in editable_cols if str(c).strip() and str(c).strip().lower() not in {"nan", "none", "null"}]
                 editable_cols = [c for c in editable_cols if not c.startswith("__")]
                 editable_cols = [c for c in editable_cols if not re.fullmatch(r"列\d+", c)]
