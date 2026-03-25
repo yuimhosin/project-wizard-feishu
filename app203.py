@@ -26,6 +26,7 @@ try:
         list_sheets_from_sheets_url,
         sync_sheets_full_replace,
         sync_sheets_update_single_cell,
+        sync_sheets_update_cells_batch,
         FEISHU_RECORD_ID_COL,
     )
     FEISHU_BITABLE_AVAILABLE = True
@@ -33,6 +34,7 @@ except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
     sync_sheets_full_replace = None  # type: ignore
     sync_sheets_update_single_cell = None  # type: ignore
+    sync_sheets_update_cells_batch = None  # type: ignore
     FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
@@ -456,10 +458,17 @@ def load_from_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def save_to_db(df: pd.DataFrame, *, feishu_single_cell: dict | None = None) -> bool:
+def save_to_db(
+    df: pd.DataFrame,
+    *,
+    feishu_single_cell: dict | None = None,
+    feishu_cells: list[dict] | None = None,
+) -> bool:
     """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。
 
+    feishu_cells: 若提供非空列表，每项含 sheet_row、column_name、value，则批量更新飞书对应单元格（非整表覆盖）。
     feishu_single_cell: 若提供且含 sheet_row、column_name、value，则仅更新飞书该单元格（不整表覆盖）。
+    优先级：feishu_cells（非空）> feishu_single_cell > 整表覆盖。feishu_cells=[] 表示仅写库、不写飞书。
     返回 True：无需写回或飞书写回成功；False：本地已写入但飞书写回失败（详见 session feishu_sync_last_error）。
     """
     if df is None or df.empty:
@@ -473,7 +482,13 @@ def save_to_db(df: pd.DataFrame, *, feishu_single_cell: dict | None = None) -> b
         url = str(st.session_state.get("feishu_bitable_url") or "").strip()
     except Exception:
         url = ""
-    if "/sheets/" not in url or sync_sheets_full_replace is None:
+    if "/sheets/" not in url:
+        return True
+    if (
+        sync_sheets_full_replace is None
+        and sync_sheets_update_single_cell is None
+        and sync_sheets_update_cells_batch is None
+    ):
         return True
     df_sync = df
     target_park = ""
@@ -495,6 +510,44 @@ def save_to_db(df: pd.DataFrame, *, feishu_single_cell: dict | None = None) -> b
                 df_sync = sub
     except Exception:
         df_sync = df
+
+    if feishu_cells is not None and len(feishu_cells) == 0:
+        return True
+
+    use_batch = (
+        feishu_cells is not None
+        and len(feishu_cells) > 0
+        and sync_sheets_update_cells_batch is not None
+    )
+    if use_batch:
+        cells_tuples: list[tuple[int, str, object]] = []
+        try:
+            for c in feishu_cells or []:
+                sr = int(c["sheet_row"])
+                coln = str(c["column_name"]).strip()
+                val = c.get("value")
+                cells_tuples.append((sr, coln, val))
+            st.info(
+                f"写回前预览：仅更新飞书 {len(cells_tuples)} 个单元格（非整表覆盖）"
+            )
+        except Exception:
+            cells_tuples = []
+        if not cells_tuples:
+            try:
+                st.session_state["feishu_sync_last_error"] = "飞书批量写回参数解析失败。"
+            except Exception:
+                pass
+            return False
+        ok, msg = sync_sheets_update_cells_batch(url, df_sync, cells_tuples)
+        try:
+            if ok:
+                st.session_state["feishu_sync_last_ok"] = msg
+                st.session_state["feishu_sync_last_error"] = ""
+            else:
+                st.session_state["feishu_sync_last_error"] = msg
+        except Exception:
+            pass
+        return bool(ok)
 
     use_single = (
         feishu_single_cell is not None
@@ -6000,8 +6053,47 @@ def _render_project_wizard(df: pd.DataFrame):
                         if "城市" in df_new.columns:
                             df_new.loc[row_id, "城市"] = matched_city or df_new.loc[row_id, "城市"]
 
+                    feishu_cells = None
+                    try:
+                        if FEISHU_RECORD_ID_COL in df_new.columns and row_id in df_new.index:
+                            _sr = int(float(str(df_new.loc[row_id, FEISHU_RECORD_ID_COL])))
+                            feishu_cells = []
+                            for col, val in updates.items():
+                                if col in df_new.columns:
+                                    feishu_cells.append(
+                                        {
+                                            "sheet_row": _sr,
+                                            "column_name": col,
+                                            "value": val,
+                                        }
+                                    )
+                            if "所属区域" in df_new.columns:
+                                vr = df_new.loc[row_id, "所属区域"]
+                                tr = target_row.get("所属区域", "")
+                                if _format_cell(tr) != _format_cell(vr):
+                                    feishu_cells.append(
+                                        {
+                                            "sheet_row": _sr,
+                                            "column_name": "所属区域",
+                                            "value": vr,
+                                        }
+                                    )
+                            if "城市" in df_new.columns:
+                                vc = df_new.loc[row_id, "城市"]
+                                tc = target_row.get("城市", "")
+                                if _format_cell(tc) != _format_cell(vc):
+                                    feishu_cells.append(
+                                        {
+                                            "sheet_row": _sr,
+                                            "column_name": "城市",
+                                            "value": vc,
+                                        }
+                                    )
+                    except Exception:
+                        feishu_cells = None
+
                     with st.spinner("正在保存项目信息并同步飞书..."):
-                        feishu_ok = save_to_db(df_new)
+                        feishu_ok = save_to_db(df_new, feishu_cells=feishu_cells)
                     if not feishu_ok:
                         err_detail = st.session_state.get("feishu_sync_last_error") or ""
                         st.error(f"本地已保存项目信息，但飞书表格写回失败。{err_detail}")

@@ -888,27 +888,51 @@ def _sheet_join_range(sheet_id: str, a1: str) -> str:
     return f"{sheet_id}!{a1}"
 
 
-def _post_insert_dimension_range(
-    spreadsheet_token: str,
-    sheet_id: str,
-    major_dimension: str,
-    start_index: int,
-    end_index: int,
-    token: str,
-    inherit_style: str | None = None,
+def _get_sheet_grid_column_count(
+    spreadsheet_token: str, sheet_id: str, token: str
+) -> int | None:
+    """从 sheets/query 读取工作表 grid 列数（与 insert_dimension endIndex 上限一致）。"""
+    try:
+        url = f"{FEISHU_API_BASE}/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") != 0:
+            return None
+        for s in (data.get("data") or {}).get("sheets") or []:
+            if str(s.get("sheet_id") or "").strip() != str(sheet_id).strip():
+                continue
+            gp = s.get("grid_properties") or {}
+            n = gp.get("column_count")
+            if n is not None:
+                try:
+                    return int(n)
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def _post_add_dimension_columns(
+    spreadsheet_token: str, sheet_id: str, length: int, token: str
 ) -> tuple[bool, str]:
-    """在指定位置插入空白行或列。列：startIndex/endIndex 为 0 起计数，插入列数 = endIndex - startIndex。"""
-    dim: dict = {
-        "sheetId": sheet_id,
-        "majorDimension": major_dimension,
-        "startIndex": start_index,
-        "endIndex": end_index,
+    """在工作表列末尾增加空白列（官方「增加行列」接口，避免 insert_dimension 的 endIndex 越界 90202）。"""
+    if length <= 0 or length >= 5000:
+        return False, "length 须在 (0,5000) 内。"
+    body = {
+        "dimension": {
+            "sheetId": sheet_id,
+            "majorDimension": "COLUMNS",
+            "length": length,
+        }
     }
-    body: dict = {"dimension": dim}
-    if inherit_style:
-        body["inheritStyle"] = inherit_style
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range"
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/dimension_range"
     req = urllib.request.Request(
         url,
         data=body_bytes,
@@ -949,14 +973,16 @@ def _ensure_sheet_column_actual_amount(
     if idx is not None:
         return True, ""
 
-    n = len(target_cols)
-    ok, err = _post_insert_dimension_range(
-        spreadsheet_token, sheet_id, "COLUMNS", n, n + 1, token, inherit_style="BEFORE"
-    )
-    if not ok:
-        return False, f"插入「实际预计金额」列失败：{err}"
+    cc_before = _get_sheet_grid_column_count(spreadsheet_token, sheet_id, token)
+    if cc_before is None or cc_before < 1:
+        cc_before = len(target_cols)
 
-    letter = _col_idx_to_letter(n)
+    ok, err = _post_add_dimension_columns(spreadsheet_token, sheet_id, 1, token)
+    if not ok:
+        return False, f"增加「实际预计金额」列失败：{err}"
+
+    new_idx = cc_before
+    letter = _col_idx_to_letter(new_idx)
     hdr = [["实际预计金额"]]
     ok2, err2 = _put_sheets_range(
         spreadsheet_token, sheet_id, f"{letter}1:{letter}1", hdr, token
@@ -1172,6 +1198,87 @@ def sync_sheets_update_single_cell(
         return False, err or "单格写入失败"
     _set_last_error("")
     return True, f"已更新飞书单元格 {sheet_id}!{a1}"
+
+
+def sync_sheets_update_cells_batch(
+    url_or_id: str,
+    df_for_resolve: pd.DataFrame,
+    cells: list[tuple[int, str, object]],
+) -> tuple[bool, str]:
+    """
+    批量更新多个单元格（同一工作表），不整表覆盖。
+    cells: (sheet_row_1based, df_column_name, raw_value)
+    """
+    if not cells:
+        return True, "无单元格需更新。"
+    spreadsheet_token, sheet_id = _parse_sheets_url(url_or_id)
+    if not spreadsheet_token:
+        return False, "链接不是 sheets 地址，未执行电子表格写回。"
+    token = _get_tenant_access_token()
+    if not token:
+        return False, get_last_error() or "无法获取 tenant_access_token。"
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not sheet_id:
+        return False, "无法解析 sheet_id。"
+
+    source_cols = [
+        c for c in df_for_resolve.columns if str(c).strip() and not str(c).startswith("__")
+    ]
+    target_cols, ferr = _fetch_merged_target_cols_for_write(spreadsheet_token, sheet_id, token)
+    if ferr:
+        return False, ferr
+    if not target_cols:
+        return False, "目标表头为空。"
+
+    if any(str(c[1]).strip() == "实际预计金额" for c in cells):
+        idx_amt = _find_sheet_column_index_for_df_column(
+            target_cols, source_cols, "实际预计金额"
+        )
+        if idx_amt is None:
+            ok_ins, e = _ensure_sheet_column_actual_amount(
+                spreadsheet_token, sheet_id, token, source_cols
+            )
+            if not ok_ins:
+                return False, e or "无法新增金额列"
+            target_cols, ferr = _fetch_merged_target_cols_for_write(
+                spreadsheet_token, sheet_id, token
+            )
+            if ferr:
+                return False, ferr
+            if not target_cols:
+                return False, "目标表头为空。"
+
+    value_ranges: list[dict] = []
+    for sheet_row_1based, df_column_name, raw_value in cells:
+        if sheet_row_1based < 1:
+            return False, f"无效的数据行号：{sheet_row_1based}"
+        idx = _find_sheet_column_index_for_df_column(
+            target_cols, source_cols, df_column_name
+        )
+        if idx is None:
+            return (
+                False,
+                f"无法在飞书表头中定位列「{df_column_name}」。",
+            )
+        letter = _col_idx_to_letter(idx)
+        cell = _normalize_cell_for_feishu(raw_value, df_column_name)
+        a1 = f"{letter}{sheet_row_1based}:{letter}{sheet_row_1based}"
+        value_ranges.append(
+            {
+                "range": _sheet_join_range(sheet_id, a1),
+                "values": [[cell]],
+            }
+        )
+
+    batch_sz = 80
+    for i in range(0, len(value_ranges), batch_sz):
+        chunk = value_ranges[i : i + batch_sz]
+        ok, err = _post_values_batch_update(spreadsheet_token, token, chunk)
+        if not ok:
+            return False, err or "批量写入失败"
+    _set_last_error("")
+    return True, f"已更新飞书 {len(cells)} 个单元格。"
 
 
 def _detect_sheet_data_start_row(spreadsheet_token: str, sheet_id: str, token: str) -> int:
