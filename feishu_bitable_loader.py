@@ -341,8 +341,9 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
     if not sheet_name:
         sheet_name = _get_sheet_name_from_metadata(spreadsheet_token, sheet_id, token)
     try:
-        # 1) 先读表头一行，避免一次性读取整个范围导致 10MB 限制
-        header_range = f"{sheet_id}!A1:ZZ1"
+        # 1) 先读表头一行，避免一次性读取整个范围导致 10MB 限制（列数>ZZ 时按 grid 列宽读全）
+        end_letter = _header_read_end_letter(spreadsheet_token, sheet_id, token)
+        header_range = f"{sheet_id}!A1:{end_letter}1"
         encoded_header = urllib.parse.quote(header_range, safe="")
         header_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_header}"
 
@@ -373,7 +374,7 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
         # 再读第二行，适配“燕园 0~7 + 第二行真实节点名”以及“预计节点（月）+ 第二行节点名”结构
         header2 = []
         try:
-            h2_range = f"{sheet_id}!A2:ZZ2"
+            h2_range = f"{sheet_id}!A2:{end_letter}2"
             h2_encoded = urllib.parse.quote(h2_range, safe="")
             h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_encoded}"
             h2_req = urllib.request.Request(
@@ -918,6 +919,17 @@ def _get_sheet_grid_column_count(
         return None
 
 
+def _header_read_end_letter(spreadsheet_token: str, sheet_id: str, token: str) -> str:
+    """
+    表头读取范围的右边界列字母。固定 A1:ZZ1 仅覆盖 702 列；列数更多时末尾列（含新增「实际预计金额」）会读不到，导致无法定位列。
+    """
+    cc = _get_sheet_grid_column_count(spreadsheet_token, sheet_id, token)
+    if cc is None or cc < 1:
+        return "ZZ"
+    cc = min(max(cc, 1), 2000)
+    return _col_idx_to_letter(cc - 1)
+
+
 def _post_add_dimension_columns(
     spreadsheet_token: str, sheet_id: str, length: int, token: str
 ) -> tuple[bool, str]:
@@ -1099,7 +1111,8 @@ def _fetch_merged_target_cols_for_write(
     读取并合并第 1、2 行表头，返回 (target_cols, None)；失败返回 ([], 错误信息)。
     """
     try:
-        header_range = f"{sheet_id}!A1:ZZ1"
+        end_letter = _header_read_end_letter(spreadsheet_token, sheet_id, token)
+        header_range = f"{sheet_id}!A1:{end_letter}1"
         encoded_header = urllib.parse.quote(header_range, safe="")
         header_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_header}"
         req_header = urllib.request.Request(
@@ -1115,7 +1128,7 @@ def _fetch_merged_target_cols_for_write(
         row1 = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
         row2: list[str] = []
         try:
-            h2_range = f"{sheet_id}!A2:ZZ2"
+            h2_range = f"{sheet_id}!A2:{end_letter}2"
             h2_enc = urllib.parse.quote(h2_range, safe="")
             h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_enc}"
             h2_req = urllib.request.Request(h2_url, method="GET", headers={"Authorization": f"Bearer {token}"})
