@@ -381,7 +381,24 @@ def _date_input_cn(
     - 若安装了 streamlit-dateinput-intl，则用其 locale=zh-cn
     - 否则回退到 st.date_input
     """
-    if _DATEINPUT_INTL_AVAILABLE and _dateinput_intl is not None:
+    missing_key = "dateinput_intl_missing_notice_shown"
+    fallback_key = "dateinput_intl_fallback_notice_shown"
+
+    if not (_DATEINPUT_INTL_AVAILABLE and _dateinput_intl is not None):
+        if not st.session_state.get(missing_key):
+            st.warning("未启用中文日期日历控件（streamlit-dateinput-intl 不可用）。将使用默认英文日历。")
+            st.session_state[missing_key] = True
+        return st.date_input(
+            label,
+            value=value,
+            min_value=min_value,
+            max_value=max_value,
+            format="YYYY-MM-DD",
+            key=key,
+        )
+
+    # 组件对 locale 字符串兼容性不一；这里给常见中文 locale 做兜底尝试。
+    for loc in ("zh", "zh-CN", "zh-cn", "zh_cn", "cn"):
         try:
             v = _dateinput_intl(
                 value=value,
@@ -389,15 +406,21 @@ def _date_input_cn(
                 max=max_value,
                 key=key,
                 format="YYYY-MM-DD",
-                locale="zh-cn",
+                locale=loc,
                 width="stretch",
             )
+            # 正常情况应直接返回 date
             if isinstance(v, date):
                 return v
             d = _str_to_date(v)
             return d if d != SENTINEL_DATE else value
         except Exception:
-            pass
+            continue
+
+    if not st.session_state.get(fallback_key):
+        st.warning("streamlit-dateinput-intl 启用但中文 locale 解析失败，已回退英文日历。")
+        st.session_state[fallback_key] = True
+
     return st.date_input(
         label,
         value=value,
