@@ -5474,7 +5474,7 @@ def _render_project_wizard(df: pd.DataFrame):
         # 注意：不要用「序号」去全表定位记录，因为序号可能在不同园区重复。
         # 这里统一用当前 DataFrame 的行索引作为行级 ID，确保选中哪条就编辑哪条。
         candidates = df_all.copy()
-        # 飞书 sheets：园区选项来自 sheets/query 的 sheet 名，避免仅加载单园区时选项被“锁死”
+        # 飞书 sheets：园区选项优先来自 sheets/query；若尚未拉结构，回退到预置社区，确保首屏中间可直接选择
         parks_list = []
         if st.session_state.get("feishu_sheets_meta"):
             meta = st.session_state.get("feishu_sheets_meta") or []
@@ -5486,6 +5486,8 @@ def _render_project_wizard(df: pd.DataFrame):
                 if name and name not in seen and name != "未知园区":
                     seen.add(name)
                     parks_list.append(name)
+        if not parks_list:
+            parks_list = [p for p in PRESET_COMMUNITIES if p and str(p).strip() and str(p) != "未知园区"]
         if not parks_list and "园区" in df_all.columns:
             parks_list = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
             parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
@@ -5496,6 +5498,21 @@ def _render_project_wizard(df: pd.DataFrame):
 
         园区 = st.selectbox("园区*", options=parks_list, index=0, key="edit_park_select")
         st.session_state["feishu_current_park"] = str(园区)
+        # 仅在用户进入中间向导并选择园区后，才按需读取飞书分表结构
+        if not st.session_state.get("feishu_sheets_meta"):
+            try:
+                base_url_for_meta = st.session_state.get("feishu_bitable_url") or ""
+                if "/sheets/" in str(base_url_for_meta):
+                    raw_meta = list_sheets_from_sheets_url(str(base_url_for_meta).strip())
+                    filtered_meta = []
+                    for x in (raw_meta or []):
+                        name = str(x.get("sheet_name") or "").strip()
+                        if _is_excluded_sheet_name(name):
+                            continue
+                        filtered_meta.append(x)
+                    st.session_state["feishu_sheets_meta"] = filtered_meta
+            except Exception:
+                st.session_state["feishu_sheets_meta"] = []
         # 关键修复：步骤1切换园区后，同步更新当前写回目标 sheet 链接，避免保存仍写到旧分表
         park_to_sheet_id = {}
         if st.session_state.get("feishu_sheets_meta"):
@@ -6116,102 +6133,10 @@ def main():
             elif "社区" in df.columns:
                 park_col = "社区"
 
-        # 首屏无数据时也展示预置社区筛选（用户选中后再懒加载对应分表）
-        if st.session_state.get("feishu_sheet_names"):
-            options = st.session_state.get("feishu_sheet_names") or []
-            default_parks = st.session_state.get("feishu_default_parks") or []
-            if park_col and not default_parks and not df.empty:
-                parks = df[park_col].dropna().unique().tolist()
-                parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
-                default_parks = parks
-            园区选择 = st.multiselect(
-                "筛选园区",
-                options=options,
-                default=default_parks,
-                key="park_filter_multiselect",
-            )
-        elif park_col:
-            parks = df[park_col].dropna().unique().tolist()
-            parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
-            园区选择 = st.multiselect("筛选园区", options=parks, default=parks) if parks else []
-        else:
-            园区选择 = []
-
-    # 飞书 sheets：按需拉取结构 + 补齐所选园区（须早于 df.empty 直接 return，否则本地无缓存时选配社区永远不会触发加载）
-    if 园区选择 and st.session_state.get("feishu_sheet_names"):
-        if not st.session_state.get("feishu_sheets_meta"):
-            try:
-                base_url = st.session_state.get("feishu_bitable_url") or ""
-                if "/sheets/" in str(base_url):
-                    raw_meta = list_sheets_from_sheets_url(str(base_url).strip())
-                    filtered_meta = []
-                    for x in (raw_meta or []):
-                        name = str(x.get("sheet_name") or "").strip()
-                        if _is_excluded_sheet_name(name):
-                            continue
-                        filtered_meta.append(x)
-                    st.session_state["feishu_sheets_meta"] = filtered_meta
-            except Exception:
-                st.session_state["feishu_sheets_meta"] = []
-
-    if st.session_state.get("feishu_sheets_meta") and 园区选择:
-        meta = st.session_state.get("feishu_sheets_meta") or []
-        park_to_sheet_id = {}
-        for x in meta:
-            name = str(x.get("sheet_name") or "").strip()
-            sid = str(x.get("sheet_id") or "").strip()
-            if _is_excluded_sheet_name(name):
-                continue
-            if name and sid and name not in park_to_sheet_id:
-                park_to_sheet_id[name] = sid
-
-        have_parks = (
-            set(map(str, df["园区"].dropna().astype(str).unique().tolist()))
-            if (not df.empty and "园区" in df.columns)
-            else set()
-        )
-        missing_parks = [p for p in 园区选择 if p and str(p).strip() and str(p) not in have_parks]
-        if missing_parks:
-            loaded_additions = []
-            cache = st.session_state.get("feishu_df_cache_by_sheet_id") or {}
-            base_url = st.session_state.get("feishu_bitable_url") or ""
-            if base_url:
-                for p in missing_parks:
-                    sid = park_to_sheet_id.get(p)
-                    if not sid:
-                        continue
-                    if sid in cache and cache[sid] is not None and not cache[sid].empty:
-                        loaded_additions.append(cache[sid])
-                        continue
-
-                    if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
-                        url_sheet = re.sub(
-                            r"([?&]sheet=)[A-Za-z0-9_]+",
-                            lambda m: m.group(1) + sid,
-                            base_url,
-                        )
-                    else:
-                        join = "&" if "?" in base_url else "?"
-                        url_sheet = base_url + f"{join}sheet={sid}"
-
-                    df_one = load_from_bitable(url_sheet, load_all_sheets=False)
-                    if df_one is not None and not df_one.empty:
-                        cache[sid] = df_one
-                        loaded_additions.append(df_one)
-
-                st.session_state["feishu_df_cache_by_sheet_id"] = cache
-                if loaded_additions:
-                    if df.empty:
-                        df = pd.concat(loaded_additions, ignore_index=True)
-                    else:
-                        df = pd.concat([df] + loaded_additions, ignore_index=True)
-                    st.caption(
-                        f"已按需补齐园区数据：{missing_parks}（新增 {sum(len(x) for x in loaded_additions)} 行）"
-                    )
-
     if df.empty:
-        st.warning("请先在侧边栏选择社区（筛选园区），系统会按需加载对应社区分表数据。")
+        st.warning("请在中间向导先选择社区，系统将按需加载该社区分表数据。")
         render_审核流程说明()
+        _render_project_wizard(df)
         return
 
     # 列名/列顺序规范化，再补齐关键列
