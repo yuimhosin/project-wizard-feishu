@@ -6137,14 +6137,8 @@ def main():
         else:
             园区选择 = []
 
-    if df.empty:
-        st.warning("请先在侧边栏选择社区（筛选园区），系统会按需加载对应社区分表数据。")
-        render_审核流程说明()
-        return
-
-    # 飞书 sheets：按需补齐所选园区的数据（避免首屏全量拉取过慢）
+    # 飞书 sheets：按需拉取结构 + 补齐所选园区（须早于 df.empty 直接 return，否则本地无缓存时选配社区永远不会触发加载）
     if 园区选择 and st.session_state.get("feishu_sheet_names"):
-        # 懒加载时才读取飞书结构，避免首屏阻塞
         if not st.session_state.get("feishu_sheets_meta"):
             try:
                 base_url = st.session_state.get("feishu_bitable_url") or ""
@@ -6160,10 +6154,7 @@ def main():
             except Exception:
                 st.session_state["feishu_sheets_meta"] = []
 
-    if (
-        st.session_state.get("feishu_sheets_meta")
-        and 园区选择
-    ):
+    if st.session_state.get("feishu_sheets_meta") and 园区选择:
         meta = st.session_state.get("feishu_sheets_meta") or []
         park_to_sheet_id = {}
         for x in meta:
@@ -6174,7 +6165,11 @@ def main():
             if name and sid and name not in park_to_sheet_id:
                 park_to_sheet_id[name] = sid
 
-        have_parks = set(map(str, df["园区"].dropna().astype(str).unique().tolist())) if (not df.empty and "园区" in df.columns) else set()
+        have_parks = (
+            set(map(str, df["园区"].dropna().astype(str).unique().tolist()))
+            if (not df.empty and "园区" in df.columns)
+            else set()
+        )
         missing_parks = [p for p in 园区选择 if p and str(p).strip() and str(p) not in have_parks]
         if missing_parks:
             loaded_additions = []
@@ -6189,7 +6184,6 @@ def main():
                         loaded_additions.append(cache[sid])
                         continue
 
-                    # 替换 URL 中的 sheet 参数，实现“只加载某一个园区”
                     if re.search(r"[?&]sheet=[A-Za-z0-9_]+", base_url):
                         url_sheet = re.sub(
                             r"([?&]sheet=)[A-Za-z0-9_]+",
@@ -6207,8 +6201,18 @@ def main():
 
                 st.session_state["feishu_df_cache_by_sheet_id"] = cache
                 if loaded_additions:
-                    df = pd.concat([df] + loaded_additions, ignore_index=True)
-                    st.caption(f"已按需补齐园区数据：{missing_parks}（新增 {sum(len(x) for x in loaded_additions)} 行）")
+                    if df.empty:
+                        df = pd.concat(loaded_additions, ignore_index=True)
+                    else:
+                        df = pd.concat([df] + loaded_additions, ignore_index=True)
+                    st.caption(
+                        f"已按需补齐园区数据：{missing_parks}（新增 {sum(len(x) for x in loaded_additions)} 行）"
+                    )
+
+    if df.empty:
+        st.warning("请先在侧边栏选择社区（筛选园区），系统会按需加载对应社区分表数据。")
+        render_审核流程说明()
+        return
 
     # 列名/列顺序规范化，再补齐关键列
     df = _canonicalize_df(df)
