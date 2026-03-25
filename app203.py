@@ -40,6 +40,8 @@ except ImportError:
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
 PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if str(x).strip()])
 EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
+# 项目信息向导：不展示、不写回飞书（仅本地/数据库保留原值）
+PROJECT_INFO_EXCLUDE_COLS = frozenset({"总部重点关注项目", "专业分包"})
 
 # 燕园等分表“阶段式表头”到标准节点列名的别名映射
 # 注意：燕园将「项目决策」拆成「立项呈批」「预算动支发起」两列，不能再把两列都映射到同一标准名（否则只会命中第一列）。
@@ -5963,9 +5965,7 @@ def _render_project_wizard(df: pd.DataFrame):
                 分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级) if "项目分级" in df_all.columns else []
                 分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类) if "项目分类" in df_all.columns else []
                 承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织) if "拟定承建组织" in df_all.columns else []
-                总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x] if "总部重点关注项目" in df_all.columns else []
                 专业_opts = _get_dropdown_options(df_all, "专业", 专业大类) if "专业" in df_all.columns else []
-                分包_opts = _get_dropdown_options(df_all, "专业分包") if "专业分包" in df_all.columns else []
 
                 # 平铺展示所有可修改项目信息（节点日期仅在「更改项目进度」编辑；表头分类如「预计节点（月份）」排除）
                 readonly_cols = {"序号", "园区", "所属区域", "城市", "上传凭证"}
@@ -5979,10 +5979,11 @@ def _render_project_wizard(df: pd.DataFrame):
                 editable_cols = [c for c in editable_cols if not c.startswith("__")]
                 editable_cols = [c for c in editable_cols if not re.fullmatch(r"列\d+", c)]
                 editable_cols = [c for c in editable_cols if c not in readonly_cols]
+                editable_cols = [c for c in editable_cols if c not in PROJECT_INFO_EXCLUDE_COLS]
 
                 preferred_order = [
-                    "所属业态", "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
-                    "专业", "专业分包", "项目名称", "备注说明", "实际预计金额",
+                    "所属业态", "项目分级", "项目分类", "拟定承建组织",
+                    "专业", "项目名称", "备注说明", "实际预计金额",
                 ]
                 editable_cols = [c for c in preferred_order if c in editable_cols] + [c for c in editable_cols if c not in preferred_order]
 
@@ -6005,15 +6006,9 @@ def _render_project_wizard(df: pd.DataFrame):
                         elif col == "拟定承建组织" and 承建_opts:
                             v = str(current_val or "")
                             updates[col] = st.selectbox(col, options=[""] + 承建_opts, index=(承建_opts.index(v) + 1) if v in 承建_opts else 0, key=f"edit_info_{project_ctx}_{col}")
-                        elif col == "总部重点关注项目" and 总部_opts:
-                            v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 总部_opts, index=(总部_opts.index(v) + 1) if v in 总部_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "专业" and 专业_opts:
                             v = str(current_val or "")
                             updates[col] = st.selectbox(col, options=[""] + 专业_opts, index=(专业_opts.index(v) + 1) if v in 专业_opts else 0, key=f"edit_info_{project_ctx}_{col}")
-                        elif col == "专业分包" and 分包_opts:
-                            v = str(current_val or "")
-                            updates[col] = st.selectbox(col, options=[""] + 分包_opts, index=(分包_opts.index(v) + 1) if v in 分包_opts else 0, key=f"edit_info_{project_ctx}_{col}")
                         elif col == "实际预计金额":
                             try:
                                 updates[col] = st.number_input(col, min_value=0.0, value=float(current_val or 0.0), step=1.0, key=f"edit_info_{project_ctx}_{col}")
@@ -6060,6 +6055,8 @@ def _render_project_wizard(df: pd.DataFrame):
                             feishu_cells = []
                             for col, val in updates.items():
                                 if col not in df_new.columns:
+                                    continue
+                                if col in PROJECT_INFO_EXCLUDE_COLS:
                                     continue
                                 ov = target_row.get(col, "")
                                 if _format_cell(ov) == _format_cell(val):
