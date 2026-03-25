@@ -17,6 +17,64 @@ _last_error = ""
 FEISHU_RECORD_ID_COL = "__feishu_record_id"
 EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
 
+# 与 _load_from_sheets 双行表头合并规则一致，用于写回时列对齐
+_TIMELINE_HEADER_TOKENS = frozenset(
+    {
+        "需求立项",
+        "需求审核",
+        "规划设计方案",
+        "成本核算",
+        "项目决策",
+        "招采",
+        "实施",
+        "验收(社区需求完成交付)",
+        "验收",
+        "结算",
+        "文字说明及构思",
+        "形成方案",
+        "运保总部审核",
+        "上联席会",
+        "立项呈批",
+        "预算动支发起",
+    }
+)
+
+
+def _norm_sheet_header_paren(s: str) -> str:
+    return str(s or "").strip().replace("（", "(").replace("）", ")")
+
+
+def _merge_sheet_header_rows(row1: list, row2: list) -> list[str]:
+    """合并第 1、2 行表头（与读取逻辑一致），返回与物理列数相同的逻辑列名列表（去重前）。"""
+    merged_header: list[str] = []
+    for i, h1 in enumerate(row1):
+        h2 = row2[i] if i < len(row2) else ""
+        h1s = str(h1).strip() if h1 is not None else ""
+        h2s = str(h2).strip() if h2 is not None else ""
+        if re.fullmatch(r"\d+", h1s or "") and h2s:
+            merged_header.append(h2s)
+            continue
+        if not h1s and h2s in _TIMELINE_HEADER_TOKENS:
+            merged_header.append(h2s)
+            continue
+        if _norm_sheet_header_paren(h1s) == "预计节点(月份)" and h2s:
+            merged_header.append(h2s)
+            continue
+        merged_header.append(h1s)
+    return merged_header
+
+
+def _dedupe_sheet_column_names(header: list) -> list[str]:
+    """与读取 DataFrame 列名规则一致，保证写回列序与读入一致。"""
+    used: dict[str, int] = {}
+    cols: list[str] = []
+    for i, h in enumerate(header):
+        name = (str(h).strip() if h is not None else "") or f"列{i + 1}"
+        cnt = used.get(name, 0)
+        used[name] = cnt + 1
+        cols.append(name if cnt == 0 else f"{name}_{cnt + 1}")
+    return cols
+
 
 def _set_last_error(msg: str):
     global _last_error
@@ -327,35 +385,8 @@ def _load_from_sheets(spreadsheet_token: str, sheet_id: str, token: str) -> pd.D
         except Exception:
             header2 = []
 
-        timeline_like = {
-            "需求立项", "需求审核", "规划设计方案", "成本核算", "项目决策",
-            "招采", "实施", "验收(社区需求完成交付)", "验收", "结算",
-            "文字说明及构思", "形成方案", "运保总部审核", "上联席会", "立项呈批", "预算动支发起",
-        }
-        merged_header = []
-        for i, h1 in enumerate(header):
-            h2 = header2[i] if i < len(header2) else ""
-            h1s = str(h1).strip()
-            h2s = str(h2).strip()
-            # 规则1：首行是 0~7 等占位编号，用第二行真实节点名替换
-            if re.fullmatch(r"\d+", h1s or "") and h2s:
-                merged_header.append(h2s)
-                continue
-            # 规则2：首行为空，但第二行是节点名，使用第二行
-            if not h1s and h2s in timeline_like:
-                merged_header.append(h2s)
-                continue
-            merged_header.append(h1s)
-        header = merged_header
-
-        # 处理重复/空表头，避免 DataFrame 列名冲突
-        used = {}
-        cols = []
-        for i, h in enumerate(header):
-            name = h or f"列{i+1}"
-            cnt = used.get(name, 0)
-            used[name] = cnt + 1
-            cols.append(name if cnt == 0 else f"{name}_{cnt+1}")
+        merged_header = _merge_sheet_header_rows(header, header2)
+        cols = _dedupe_sheet_column_names(merged_header)
 
         # 2) 把列数映射为列字母，避免每次都请求到 ZZ
         def _col_to_letter(n: int) -> str:
@@ -803,9 +834,9 @@ def _detect_sheet_data_start_row(spreadsheet_token: str, sheet_id: str, token: s
 def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool, str]:
     """
     将 DataFrame 全量覆盖写回飞书电子表格（Sheets）。
-    - 保留原表头（不覆盖第 1 行），按原表头顺序写入数据
-    - 第 2 行开始写数据（分块）
-    - 若新数据比旧数据少，会把剩余区域清空
+    - 不覆盖表头区：从探测到的数据起始行开始写入
+    - 列名与读取一致：合并第 1、2 行表头（与 _load_from_sheets 相同），避免「0/1/2」或「预计节点」占位导致进度列写空
+    - 按 __feishu_record_id 排序后再写，避免本地库行序与表格不一致
     """
     spreadsheet_token, sheet_id = _parse_sheets_url(url_or_id)
     if not spreadsheet_token:
@@ -826,7 +857,7 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     if not source_cols:
         return False, "无可写回列。"
 
-    # 读取原始表头，确保按原分表结构写入，避免“串列/错位”
+    # 读取第 1、2 行并合并表头（与 _load_from_sheets 一致），否则双行表头分表的进度列无法对齐
     try:
         header_range = f"{sheet_id}!A1:ZZ1"
         encoded_header = urllib.parse.quote(header_range, safe="")
@@ -841,13 +872,27 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         if header_data.get("code") != 0:
             return False, f"读取原表头失败：code={header_data.get('code')} msg={header_data.get('msg')}"
         header_values = header_data.get("data", {}).get("valueRange", {}).get("values", []) or []
-        target_cols = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
-        target_cols = [c for c in target_cols if c]
+        row1 = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
+        row2: list[str] = []
+        try:
+            h2_range = f"{sheet_id}!A2:ZZ2"
+            h2_enc = urllib.parse.quote(h2_range, safe="")
+            h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_enc}"
+            h2_req = urllib.request.Request(h2_url, method="GET", headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(h2_req, timeout=30) as resp:
+                h2_data = json.loads(resp.read().decode())
+            if h2_data.get("code") == 0:
+                h2_vals = (h2_data.get("data") or {}).get("valueRange", {}).get("values", []) or []
+                if h2_vals:
+                    row2 = [str(x).strip() if x is not None else "" for x in h2_vals[0]]
+        except Exception:
+            row2 = []
+        merged = _merge_sheet_header_rows(row1, row2)
+        target_cols = _dedupe_sheet_column_names(merged)
     except Exception as e:
         return False, f"读取原表头异常：{_format_http_error(e)}"
 
     if not target_cols:
-        # 极端兜底：若读不到原表头，则沿用当前数据列（不建议，但保证可写）
         target_cols = [str(c).strip() for c in source_cols if str(c).strip()]
     if not target_cols:
         return False, "目标表头为空，无法写回。"
@@ -878,8 +923,20 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
                 return sc
         return None
 
+    df_write = df_new.copy()
+    if FEISHU_RECORD_ID_COL in df_write.columns:
+        try:
+            df_write["_feishu_sheet_row"] = pd.to_numeric(
+                df_write[FEISHU_RECORD_ID_COL], errors="coerce"
+            )
+            df_write = df_write.sort_values(
+                "_feishu_sheet_row", kind="mergesort", na_position="last"
+            ).drop(columns=["_feishu_sheet_row"])
+        except Exception:
+            df_write = df_new
+
     values = []
-    for _, row in df_new.iterrows():
+    for _, row in df_write.iterrows():
         one = []
         for tc in target_cols:
             src = _resolve_source_col(tc)
