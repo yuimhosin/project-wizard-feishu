@@ -964,6 +964,46 @@ def _post_add_dimension_columns(
         return False, _format_http_error(e)
 
 
+def _post_insert_dimension_range(
+    spreadsheet_token: str,
+    sheet_id: str,
+    major_dimension: str,
+    start_index: int,
+    end_index: int,
+    token: str,
+    inherit_style: str | None = "BEFORE",
+) -> tuple[bool, str]:
+    """在指定位置插入空白行或列（列：插入列数 = endIndex - startIndex）。"""
+    dim: dict = {
+        "sheetId": sheet_id,
+        "majorDimension": major_dimension,
+        "startIndex": start_index,
+        "endIndex": end_index,
+    }
+    body: dict = {"dimension": dim}
+    if inherit_style:
+        body["inheritStyle"] = inherit_style
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range"
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") == 0:
+            return True, ""
+        return False, f"code={data.get('code')} msg={data.get('msg')}"
+    except Exception as e:
+        return False, _format_http_error(e)
+
+
 def _ensure_sheet_column_actual_amount(
     spreadsheet_token: str,
     sheet_id: str,
@@ -971,7 +1011,8 @@ def _ensure_sheet_column_actual_amount(
     source_cols: list[str],
 ) -> tuple[bool, str]:
     """
-    若合并表头中尚无法定位「实际预计金额」列，则在表尾插入一列并写入表头，便于后续单格或整表写回。
+    若合并表头中尚无法定位「实际预计金额」列，则在「拟定金额」右侧插入一列并写表头；
+    若无「拟定金额」列则退化为在表尾增加一列。
     """
     target_cols, ferr = _fetch_merged_target_cols_for_write(spreadsheet_token, sheet_id, token)
     if ferr:
@@ -985,16 +1026,25 @@ def _ensure_sheet_column_actual_amount(
     if idx is not None:
         return True, ""
 
-    cc_before = _get_sheet_grid_column_count(spreadsheet_token, sheet_id, token)
-    if cc_before is None or cc_before < 1:
-        cc_before = len(target_cols)
+    k = _index_of_拟定金额_sheet_col(target_cols)
+    if k is not None:
+        ins_start = k + 1
+        ins_end = k + 2
+        ok, err = _post_insert_dimension_range(
+            spreadsheet_token, sheet_id, "COLUMNS", ins_start, ins_end, token
+        )
+        if not ok:
+            return False, f"在「拟定金额」右侧插入列失败：{err}"
+        letter = _col_idx_to_letter(ins_start)
+    else:
+        cc_before = _get_sheet_grid_column_count(spreadsheet_token, sheet_id, token)
+        if cc_before is None or cc_before < 1:
+            cc_before = len(target_cols)
+        ok, err = _post_add_dimension_columns(spreadsheet_token, sheet_id, 1, token)
+        if not ok:
+            return False, f"增加「实际预计金额」列失败：{err}"
+        letter = _col_idx_to_letter(cc_before)
 
-    ok, err = _post_add_dimension_columns(spreadsheet_token, sheet_id, 1, token)
-    if not ok:
-        return False, f"增加「实际预计金额」列失败：{err}"
-
-    new_idx = cc_before
-    letter = _col_idx_to_letter(new_idx)
     hdr = [["实际预计金额"]]
     ok2, err2 = _put_sheets_range(
         spreadsheet_token, sheet_id, f"{letter}1:{letter}1", hdr, token
@@ -1069,6 +1119,19 @@ def _post_values_batch_update(
         return False, _format_http_error(e)
 
 
+def _index_of_拟定金额_sheet_col(target_cols: list[str]) -> int | None:
+    """合并表头中「拟定金额」列的 0-based 索引（排除「实际预计金额」）。"""
+    for i, tc in enumerate(target_cols):
+        s = str(tc).strip()
+        if not s:
+            continue
+        if s == "实际预计金额" or "实际预计金额" in s:
+            continue
+        if "拟定金额" in s:
+            return i
+    return None
+
+
 def _resolve_df_column_for_sheet_header(target_col: str, source_cols: list[str]) -> str | None:
     """表头列名 → DataFrame 中对应列名（与 sync 写回逻辑一致）。"""
     if target_col in source_cols:
@@ -1089,19 +1152,34 @@ def _find_sheet_column_index_for_df_column(
 ) -> int | None:
     """在合并后的表头列序列中，找到与 df 列名对应的那一列索引（0-based）。"""
     dfn = str(df_column_name).strip()
+    candidates: list[int] = []
     for i, tc in enumerate(target_cols):
         if str(tc).strip() == dfn:
-            return i
-    for i, tc in enumerate(target_cols):
-        src = _resolve_df_column_for_sheet_header(tc, source_cols)
-        if src == dfn:
-            return i
-    dfn_base = re.sub(r"[（(].*?[)）]", "", dfn).strip()
-    for i, tc in enumerate(target_cols):
-        tcb = re.sub(r"[（(].*?[)）]", "", str(tc)).strip()
-        if tcb and dfn_base and tcb == dfn_base:
-            return i
-    return None
+            candidates.append(i)
+    if not candidates:
+        for i, tc in enumerate(target_cols):
+            src = _resolve_df_column_for_sheet_header(tc, source_cols)
+            if src == dfn:
+                candidates.append(i)
+    if not candidates:
+        dfn_base = re.sub(r"[（(].*?[)）]", "", dfn).strip()
+        for i, tc in enumerate(target_cols):
+            tcb = re.sub(r"[（(].*?[)）]", "", str(tc)).strip()
+            if tcb and dfn_base and tcb == dfn_base:
+                candidates.append(i)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if dfn == "实际预计金额":
+        k = _index_of_拟定金额_sheet_col(target_cols)
+        if k is not None and (k + 1) in candidates:
+            return k + 1
+        if k is not None:
+            after_k = [i for i in candidates if i > k]
+            if after_k:
+                return min(after_k)
+    return candidates[0]
 
 
 def _fetch_merged_target_cols_for_write(
