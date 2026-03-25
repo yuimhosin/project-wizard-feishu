@@ -6107,14 +6107,7 @@ def _render_project_wizard(df: pd.DataFrame):
         st.text_input("所属区域（自动匹配，只读）", value=str(matched_region or ""), disabled=True, key=f"ro_region_{project_ctx}")
         st.text_input("城市（自动匹配，只读）", value=str(matched_city or ""), disabled=True, key=f"ro_city_{project_ctx}")
 
-        info_edit_choice = st.radio(
-            "项目信息修改确认（写回飞书）",
-            options=["不修改", "确认修改"],
-            index=0,
-            key=f"info_edit_choice_{project_ctx}",
-            horizontal=True,
-        )
-        if info_edit_choice == "确认修改":
+        with st.expander("项目信息修改（写回飞书）", expanded=False):
             with st.form(f"edit_info_form_{project_ctx}"):
                 updates = {}
 
