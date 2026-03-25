@@ -40,17 +40,42 @@ PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if 
 EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
 
 # 燕园等分表“阶段式表头”到标准节点列名的别名映射
+# 注意：燕园将「项目决策」拆成「立项呈批」「预算动支发起」两列，不能再把两列都映射到同一标准名（否则只会命中第一列）。
 TIMELINE_ALIAS_MAP = {
     "需求立项": ["文字说明及构思"],
     "需求审核": ["形成方案"],
     "规划设计方案": ["运保总部审核"],
     "成本核算": ["上联席会"],
-    "项目决策": ["立项呈批", "预算动支发起"],
+    "项目决策": ["项目决策"],
+    "立项呈批": ["立项呈批"],
+    "预算动支发起": ["预算动支发起"],
     "招采": ["招采"],
     "实施": ["实施"],
     "验收": ["验收(社区需求完成交付)"],
     "结算": ["结算"],
 }
+
+# 燕园飞书表头：第 1 行 0～7 + 空 + 空，第 2 行对应节点名；与标准 9 列的差异是「项目决策」拆成两列
+TIMELINE_COLS_YANYUAN = [
+    "需求立项",
+    "需求审核",
+    "规划设计方案",
+    "成本核算",
+    "立项呈批",
+    "预算动支发起",
+    "招采",
+    "实施",
+    "验收",
+    "结算",
+]
+
+
+def _timeline_progress_choices(park: str) -> list[str]:
+    """「更改项目进度」下拉的节点列表：燕园为 10 列（立项呈批 / 预算动支发起 拆分），其余园区为全局 9 列。"""
+    p = str(park or "").strip()
+    if p == "燕园":
+        return list(TIMELINE_COLS_YANYUAN)
+    return list(TIMELINE_COLS)
 
 
 @lru_cache(maxsize=1)
@@ -58,6 +83,9 @@ def _all_timeline_column_names() -> frozenset:
     """标准节点、飞书原表头、燕园阶段别名等：一律在「更改项目进度」里用日期编辑，不出现在项目信息文本框。"""
     names: set[str] = set()
     for c in TIMELINE_COLS:
+        if c and str(c).strip():
+            names.add(str(c).strip())
+    for c in TIMELINE_COLS_YANYUAN:
         if c and str(c).strip():
             names.add(str(c).strip())
     for k, v in TIMELINE_COL_MAP.items():
@@ -614,12 +642,30 @@ def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for tcol in TIMELINE_COLS:
         if tcol in out.columns:
             out[tcol] = out[tcol].apply(_normalize_timeline_value)
+    for tcol in ("立项呈批", "预算动支发起"):
+        if tcol in out.columns:
+            out[tcol] = out[tcol].apply(_normalize_timeline_value)
     base_order = [
         "序号", "园区", "所属区域", "城市", "所属业态",
         "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
         "专业", "专业分包", "项目名称", "备注说明", "实际预计金额",
     ]
-    timeline_cols = [c for c in TIMELINE_COLS if c in out.columns]
+    # 燕园：无「项目决策」列时，用「立项呈批」「预算动支发起」占位并保持与表头顺序一致
+    if "项目决策" not in out.columns and (
+        "立项呈批" in out.columns or "预算动支发起" in out.columns
+    ):
+        timeline_cols = []
+        for c in TIMELINE_COLS:
+            if c == "项目决策":
+                if "立项呈批" in out.columns:
+                    timeline_cols.append("立项呈批")
+                if "预算动支发起" in out.columns:
+                    timeline_cols.append("预算动支发起")
+                continue
+            if c in out.columns:
+                timeline_cols.append(c)
+    else:
+        timeline_cols = [c for c in TIMELINE_COLS if c in out.columns]
     extra = ["上传凭证"] if "上传凭证" in out.columns else []
     want = base_order + timeline_cols + extra
     existing = list(out.columns)
@@ -5771,7 +5817,7 @@ def _render_project_wizard(df: pd.DataFrame):
                     st.rerun()
 
         st.markdown("#### 更改项目进度")
-        timeline_opts = ["（不修改进度）"] + list(TIMELINE_COLS)
+        timeline_opts = ["（不修改进度）"] + _timeline_progress_choices(园区)
         chosen_timeline_col = st.selectbox("选择要更新的进度节点", options=timeline_opts, index=0, key=f"edit_progress_menu_{project_ctx}")
 
         if chosen_timeline_col and chosen_timeline_col != "（不修改进度）":
@@ -6037,6 +6083,9 @@ def _render_project_wizard(df: pd.DataFrame):
         实际预计金额 = st.number_input("实际预计金额（万元）*", min_value=0.0, value=0.0, step=1.0)
 
         st.markdown("**项目节点日期**（日期全列出，可统一填写）")
+        add_timeline_cols = _timeline_progress_choices(园区)
+        if str(园区 or "").strip() == "燕园":
+            st.caption("燕园分表为 10 个进度节点（立项呈批、预算动支发起分列），与飞书表头 0～7 及验收、结算一致。")
         timeline_values = {}
         unify_all = st.checkbox("统一填写所有节点日期", value=False, key="add_timeline_unify_all")
         if unify_all:
@@ -6048,11 +6097,11 @@ def _render_project_wizard(df: pd.DataFrame):
                 format="YYYY-MM-DD",
                 key="add_timeline_unified_date",
             )
-            for col in TIMELINE_COLS:
+            for col in add_timeline_cols:
                 timeline_values[col] = _date_to_str(unified_date)
         else:
             st.caption("不想填写的节点勾选“留空”。")
-            for col in TIMELINE_COLS:
+            for col in add_timeline_cols:
                 cc1, cc2 = st.columns([3, 1])
                 with cc1:
                     dval = st.date_input(
@@ -6102,7 +6151,8 @@ def _render_project_wizard(df: pd.DataFrame):
 
         token = str(uuid.uuid4())
         form_dict["上传凭证"] = token
-        for col in TIMELINE_COLS:
+        _add_cols = _timeline_progress_choices(form_dict.get("园区") or "")
+        for col in _add_cols:
             if col not in form_dict:
                 form_dict[col] = ""
             if col in timeline_values:
