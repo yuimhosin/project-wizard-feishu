@@ -186,6 +186,53 @@ def _parse_sheets_url(url_or_id: str) -> tuple[str, str]:
     return "", ""
 
 
+def get_sheets_cell_value(url_or_id: str, a1: str) -> tuple[bool, object]:
+    """
+    读取飞书 Sheets 的单元格值（按 A1 坐标）。
+
+    用途：当界面出现类似「J3+7」的日期公式文本时，可读取被引用的基准单元格值再计算偏移。
+    返回：(ok, value_or_errmsg)。
+    """
+    spreadsheet_token, sheet_id = _parse_sheets_url(url_or_id)
+    if not spreadsheet_token:
+        return False, "链接不是 sheets 地址，未执行电子表格读取。"
+    a1 = str(a1 or "").strip().upper()
+    if not a1:
+        return False, "A1 坐标为空。"
+
+    token = _get_tenant_access_token()
+    if not token:
+        return False, get_last_error() or "无法获取 tenant_access_token。"
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not sheet_id:
+        return False, "无法解析 sheet_id。"
+
+    # values 接口：使用 range 获取单元格值
+    cell_range = f"{sheet_id}!{a1}:{a1}"
+    encoded = urllib.parse.quote(cell_range, safe="")
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded}"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") != 0:
+            return False, f"读取单元格失败：code={data.get('code')} msg={data.get('msg')}"
+        values = (data.get("data") or {}).get("valueRange", {}).get("values", []) or []
+        if not values:
+            return True, ""
+        row0 = values[0] or []
+        if not row0:
+            return True, ""
+        return True, row0[0] if len(row0) > 0 else ""
+    except Exception as e:
+        return False, _format_http_error(e)
+
+
 def list_sheets_from_sheets_url(url_or_id: str) -> list[dict]:
     """
     读取 sheets 电子表格下所有 sheet 元信息（sheet_id + sheet_name）。

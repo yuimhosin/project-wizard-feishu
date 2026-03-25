@@ -13,7 +13,7 @@ import os
 import json
 import re
 import urllib.request
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import lru_cache
 from urllib.parse import quote_plus
 from data_loader import get_稳定需求_mask, TIMELINE_COLS, TIMELINE_COL_MAP
@@ -24,6 +24,7 @@ try:
         load_from_bitable,
         get_last_error as get_bitable_last_error,
         list_sheets_from_sheets_url,
+        get_sheets_cell_value,
         sync_sheets_full_replace,
         sync_sheets_update_single_cell,
         sync_sheets_update_cells_batch,
@@ -35,6 +36,7 @@ except ImportError:
     sync_sheets_full_replace = None  # type: ignore
     sync_sheets_update_single_cell = None  # type: ignore
     sync_sheets_update_cells_batch = None  # type: ignore
+    get_sheets_cell_value = None  # type: ignore
     FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
@@ -366,6 +368,99 @@ def _normalize_timeline_value(v) -> str:
         return _date_to_str(d)
     s = str(v).strip() if v is not None else ""
     return "" if s.lower() in {"", "nan", "none", "null"} else s
+
+
+_FEISHU_DATE_FORMULA_RE = re.compile(r"^([A-Z]{1,3})(\d+)\+(\d+)$")
+
+
+def _resolve_feishu_date_formula_to_date(
+    sheet_url: str,
+    raw_value,
+    formula_cache: dict,
+    *,
+    max_depth: int = 2,
+) -> date | None:
+    """
+    将飞书返回的日期公式文本（如「J3+7」）尝试解析为真实日期：
+    1) 取公式中的基准单元格（如 J3）
+    2) 读取该单元格值
+    3) 解析为日期并加上偏移天数
+    """
+    try:
+        s = str(raw_value).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    s = s.upper()
+    m = _FEISHU_DATE_FORMULA_RE.match(s)
+    if not m:
+        return None
+    if not sheet_url or "/sheets/" not in str(sheet_url):
+        return None
+    if get_sheets_cell_value is None:
+        return None
+
+    cache_key = f"{sheet_url}|{s}"
+    cached = formula_cache.get(cache_key, None)
+    if cached is not None:
+        if cached:
+            return _str_to_date(cached)  # cached is YYYY-MM-DD
+        return None
+
+    if max_depth <= 0:
+        formula_cache[cache_key] = ""
+        return None
+
+    ref_col, ref_row, offset_days = m.group(1), int(m.group(2)), int(m.group(3))
+    ref_a1 = f"{ref_col}{ref_row}"
+
+    ok, base_raw = get_sheets_cell_value(sheet_url, ref_a1)
+    if not ok:
+        formula_cache[cache_key] = ""
+        return None
+
+    # 基准值若还是公式，递归解析
+    base_date = _resolve_feishu_date_formula_to_date(
+        sheet_url,
+        base_raw,
+        formula_cache,
+        max_depth=max_depth - 1,
+    )
+    if base_date is None:
+        base_date = _str_to_date(base_raw)
+
+    if base_date == SENTINEL_DATE:
+        formula_cache[cache_key] = ""
+        return None
+
+    try:
+        d = base_date + timedelta(days=offset_days)
+    except Exception:
+        formula_cache[cache_key] = ""
+        return None
+
+    formula_cache[cache_key] = _date_to_str(d)
+    return d
+
+
+def _format_timeline_value_for_ui(
+    sheet_url: str,
+    raw_value,
+    formula_cache: dict,
+) -> str:
+    """给「日期节点」做 UI 展示：尽量显示 YYYY-MM-DD，而不是「J3+7」。"""
+    d = _resolve_feishu_date_formula_to_date(sheet_url, raw_value, formula_cache)
+    if d is not None and d != SENTINEL_DATE:
+        return _date_to_str(d)
+    d2 = _str_to_date(raw_value)
+    if d2 != SENTINEL_DATE:
+        return _date_to_str(d2)
+    s = str(raw_value or "").strip()
+    if _FEISHU_DATE_FORMULA_RE.match(s.upper()):
+        # 仍无法解析：至少别再把公式文本暴露给业务同事
+        return ""
+    return _format_cell(raw_value)
 
 
 def _resolve_timeline_column(df: pd.DataFrame, chosen_col: str) -> str | None:
@@ -5814,16 +5909,38 @@ def _render_project_wizard(df: pd.DataFrame):
             st.session_state.pop(f"enable_info_edit_{project_ctx}", None)
             st.session_state.pop(f"edit_progress_menu_{project_ctx}", None)
 
-        # 选中项目详情展示（不再显示园区列表）
+        # 项目详情：用下拉框切换「摘要/全部字段」，避免先简略再展开的两段式体验
         st.markdown("---")
-        st.markdown("### 已选择项目详情")
-        summary_cols = [c for c in ["序号", "园区", "项目名称", "项目分级", "项目分类", "专业", "专业分包", "实际预计金额"] if c in df_all.columns]
-        if summary_cols:
-            st.dataframe(pd.DataFrame([target_row[summary_cols].to_dict()]), use_container_width=True, hide_index=True)
-        with st.expander("查看全部字段详情（含日期）", expanded=False):
+        st.markdown("### 项目详情")
+        detail_view = st.selectbox(
+            "查看项目详细信息",
+            options=["摘要信息", "全部字段详情（含日期）"],
+            index=0,
+            key=f"project_detail_view_{project_ctx}",
+        )
+
+        sheet_url = str(st.session_state.get("feishu_bitable_url") or "").strip()
+        formula_cache = st.session_state.setdefault("feishu_date_formula_cache", {})
+
+        if detail_view == "摘要信息":
+            summary_cols = [
+                c
+                for c in ["序号", "园区", "项目名称", "项目分级", "项目分类", "专业", "专业分包", "实际预计金额"]
+                if c in df_all.columns
+            ]
+            if summary_cols:
+                st.dataframe(
+                    pd.DataFrame([target_row[summary_cols].to_dict()]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("暂无摘要字段可展示。")
+        else:
             # 以“字段-值”形式展示，便于一眼核对
             full = target_row.to_dict()
             show_items = []
+            timeline_cols = _all_timeline_column_names()
             for k, v in full.items():
                 if k is None:
                     continue
@@ -5834,7 +5951,11 @@ def _render_project_wizard(df: pd.DataFrame):
                     continue
                 if _is_structural_sheet_header_col(ks):
                     continue
-                show_items.append({"字段": ks, "值": _format_cell(v)})
+                if ks in timeline_cols:
+                    val_str = _format_timeline_value_for_ui(sheet_url, v, formula_cache)
+                    show_items.append({"字段": ks, "值": val_str})
+                else:
+                    show_items.append({"字段": ks, "值": _format_cell(v)})
             if show_items:
                 st.dataframe(pd.DataFrame(show_items), use_container_width=True, hide_index=True)
             else:
@@ -5879,7 +6000,8 @@ def _render_project_wizard(df: pd.DataFrame):
             with st.form(f"edit_progress_form_{project_ctx}"):
                 target_timeline_col = _resolve_timeline_column(df_all, chosen_timeline_col) or chosen_timeline_col
                 raw_val = target_row.get(target_timeline_col, "")
-                existing_d = _str_to_date(raw_val)
+                # 若飞书返回了日期公式文本（如 J3+7），尝试解析为真实日期；否则走原日期解析
+                existing_d = _resolve_feishu_date_formula_to_date(sheet_url, raw_val, formula_cache) or _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
                 # 标签优先用飞书实际列名（如「验收(社区需求完成交付)」），便于与表格表头一致
                 _tl_label = str(target_timeline_col).strip() if target_timeline_col else chosen_timeline_col
@@ -5955,8 +6077,14 @@ def _render_project_wizard(df: pd.DataFrame):
         st.text_input("所属区域（自动匹配，只读）", value=str(matched_region or ""), disabled=True, key=f"ro_region_{project_ctx}")
         st.text_input("城市（自动匹配，只读）", value=str(matched_city or ""), disabled=True, key=f"ro_city_{project_ctx}")
 
-        enable_info_edit = st.checkbox("启用项目信息修改", value=False, key=f"enable_info_edit_{project_ctx}")
-        if enable_info_edit:
+        info_edit_choice = st.radio(
+            "项目信息修改确认（写回飞书）",
+            options=["不修改", "确认修改"],
+            index=0,
+            key=f"info_edit_choice_{project_ctx}",
+            horizontal=True,
+        )
+        if info_edit_choice == "确认修改":
             with st.form(f"edit_info_form_{project_ctx}"):
                 updates = {}
 
@@ -6178,41 +6306,29 @@ def _render_project_wizard(df: pd.DataFrame):
         备注说明 = st.text_area("备注说明（选填）")
         实际预计金额 = st.number_input("实际预计金额（万元）*", min_value=0.0, value=0.0, step=1.0)
 
-        st.markdown("**项目节点日期**（日期全列出，可统一填写）")
+        st.markdown("**项目节点日期**（只填写需要的节点；不勾选表示留空）")
         add_timeline_cols = _timeline_progress_choices(园区)
         if str(园区 or "").strip() == "燕园":
             st.caption("燕园分表为 10 个进度节点（立项呈批、预算动支发起分列），与飞书表头 0～7 及验收、结算一致。")
-        timeline_values = {}
-        unify_all = st.checkbox("统一填写所有节点日期", value=False, key="add_timeline_unify_all")
-        if unify_all:
-            unified_date = st.date_input(
-                "统一日期（将写入所有节点）",
-                value=date(2026, 1, 1),
-                min_value=DATE_RANGE_MIN,
-                max_value=DATE_RANGE_MAX,
-                format="YYYY-MM-DD",
-                key="add_timeline_unified_date",
-            )
-            for col in add_timeline_cols:
-                timeline_values[col] = _date_to_str(unified_date)
-        else:
-            st.caption("不想填写的节点勾选“留空”。")
-            for col in add_timeline_cols:
-                cc1, cc2 = st.columns([3, 1])
-                with cc1:
-                    dval = st.date_input(
-                        col,
-                        value=date(2026, 1, 1),
-                        min_value=DATE_RANGE_MIN,
-                        max_value=DATE_RANGE_MAX,
-                        format="YYYY-MM-DD",
-                        key=f"add_timeline_date_{col}",
-                    )
-                with cc2:
-                    leave_empty = st.checkbox("留空", value=True, key=f"add_timeline_empty_{col}")
-                timeline_values[col] = "" if leave_empty else _date_to_str(dval)
 
-        submitted = st.form_submit_button("✅ 完成并写入数据库")
+        timeline_values = {}
+        # 逐节点让用户“是否填写”更直观；避免“统一填写/留空”这种两步理解成本
+        for col in add_timeline_cols:
+            use_this = st.checkbox(f"填写 {col} 日期", value=False, key=f"add_timeline_use_{col}")
+            if use_this:
+                dval = st.date_input(
+                    col,
+                    value=date(2026, 1, 1),
+                    min_value=DATE_RANGE_MIN,
+                    max_value=DATE_RANGE_MAX,
+                    format="YYYY-MM-DD",
+                    key=f"add_timeline_date_{col}",
+                )
+                timeline_values[col] = _date_to_str(dval)
+            else:
+                timeline_values[col] = ""
+
+        submitted = st.form_submit_button("确认")
 
     if submitted:
         form_dict = {
