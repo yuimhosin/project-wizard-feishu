@@ -6059,14 +6059,18 @@ def _render_project_wizard(df: pd.DataFrame):
                             _sr = int(float(str(df_new.loc[row_id, FEISHU_RECORD_ID_COL])))
                             feishu_cells = []
                             for col, val in updates.items():
-                                if col in df_new.columns:
-                                    feishu_cells.append(
-                                        {
-                                            "sheet_row": _sr,
-                                            "column_name": col,
-                                            "value": val,
-                                        }
-                                    )
+                                if col not in df_new.columns:
+                                    continue
+                                ov = target_row.get(col, "")
+                                if _format_cell(ov) == _format_cell(val):
+                                    continue
+                                feishu_cells.append(
+                                    {
+                                        "sheet_row": _sr,
+                                        "column_name": col,
+                                        "value": val,
+                                    }
+                                )
                             if "所属区域" in df_new.columns:
                                 vr = df_new.loc[row_id, "所属区域"]
                                 tr = target_row.get("所属区域", "")
@@ -6119,6 +6123,9 @@ def _render_project_wizard(df: pd.DataFrame):
                             push_to_feishu(payload=payload)
                         st.session_state["ui_save_last_ok"] = "项目信息修改已保存。"
                         st.success("已保存项目信息更改。")
+                        _fok = str(st.session_state.get("feishu_sync_last_ok") or "")
+                        if _fok and "跳过" in _fok:
+                            st.warning(_fok)
                         st.rerun()
         return
 

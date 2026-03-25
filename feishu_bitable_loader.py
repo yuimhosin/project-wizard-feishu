@@ -1249,6 +1249,7 @@ def sync_sheets_update_cells_batch(
             if not target_cols:
                 return False, "目标表头为空。"
 
+    skipped: list[str] = []
     value_ranges: list[dict] = []
     for sheet_row_1based, df_column_name, raw_value in cells:
         if sheet_row_1based < 1:
@@ -1257,10 +1258,8 @@ def sync_sheets_update_cells_batch(
             target_cols, source_cols, df_column_name
         )
         if idx is None:
-            return (
-                False,
-                f"无法在飞书表头中定位列「{df_column_name}」。",
-            )
+            skipped.append(str(df_column_name).strip())
+            continue
         letter = _col_idx_to_letter(idx)
         cell = _normalize_cell_for_feishu(raw_value, df_column_name)
         a1 = f"{letter}{sheet_row_1based}:{letter}{sheet_row_1based}"
@@ -1271,6 +1270,14 @@ def sync_sheets_update_cells_batch(
             }
         )
 
+    if not value_ranges:
+        hint = "、".join(skipped) if skipped else ""
+        return (
+            False,
+            f"飞书表头中无对应列，无法写回。"
+            + (f"（{hint}）" if hint else ""),
+        )
+
     batch_sz = 80
     for i in range(0, len(value_ranges), batch_sz):
         chunk = value_ranges[i : i + batch_sz]
@@ -1278,7 +1285,11 @@ def sync_sheets_update_cells_batch(
         if not ok:
             return False, err or "批量写入失败"
     _set_last_error("")
-    return True, f"已更新飞书 {len(cells)} 个单元格。"
+    n_ok = len(value_ranges)
+    msg = f"已更新飞书 {n_ok} 个单元格。"
+    if skipped:
+        msg += f" 以下列在原表中无对应列已跳过：{'、'.join(skipped)}"
+    return True, msg
 
 
 def _detect_sheet_data_start_row(spreadsheet_token: str, sheet_id: str, token: str) -> int:
