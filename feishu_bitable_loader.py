@@ -7,6 +7,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import math
 from typing import Optional
 
 import pandas as pd
@@ -16,6 +17,9 @@ _token_cache = {"token": None, "expires_at": 0}
 _last_error = ""
 FEISHU_RECORD_ID_COL = "__feishu_record_id"
 EXCLUDED_SHEET_NAMES = {"汇总分析", "填写备注", "百万级项目明细"}
+# 开放平台「向单个范围写入数据」：单次不得超过 5000 行、100 列，超出会报 90202 validate RangeVal fail
+FEISHU_VALUES_MAX_COLS = 100
+FEISHU_VALUES_MAX_ROWS = 5000
 
 # 与 _load_from_sheets 双行表头合并规则一致，用于写回时列对齐
 _TIMELINE_HEADER_TOKENS = frozenset(
@@ -755,6 +759,28 @@ def load_from_bitable(url_or_id: str, load_all_sheets: bool = False) -> pd.DataF
     return pd.DataFrame(all_records)
 
 
+def _normalize_cell_for_feishu(v) -> object:
+    """飞书 values 校验不接受 NaN/部分 numpy 标量；JSON 也需合法。"""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    if hasattr(v, "item") and not isinstance(v, (bytes, str, dict, list)):
+        try:
+            v = v.item()
+        except Exception:
+            pass
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return ""
+    if isinstance(v, (int, float, bool)):
+        return v
+    return str(v)
+
+
 def _col_idx_to_letter(idx: int) -> str:
     n = idx + 1
     letters = []
@@ -904,8 +930,8 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     old_df = _load_from_sheets(spreadsheet_token, sheet_id, token)
     old_rows = 0 if old_df is None else len(old_df)
 
-    # 1) 写数据（分块）- 从探测到的数据起始行开始，不覆盖原表头区域
-    last_col = _col_idx_to_letter(len(target_cols) - 1)
+    # 1) 写数据（分块：行 + 列均受飞书单次上限约束）
+    ncols = len(target_cols)
 
     def _resolve_source_col(target_col: str) -> str | None:
         # 直接命中
@@ -951,51 +977,55 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         for tc in target_cols:
             src = _resolve_source_col(tc)
             v = row.get(src, "") if src else ""
-            if pd.isna(v) or v is None:
-                one.append("")
-            elif isinstance(v, (int, float)):
-                one.append(v)
-            else:
-                one.append(str(v))
+            one.append(_normalize_cell_for_feishu(v))
         values.append(one)
     if not values:
         return False, "写回数据为空（过滤后无可写入行）。"
 
-    chunk_size = 400
-    for i in range(0, len(values), chunk_size):
-        chunk = values[i : i + chunk_size]
+    row_chunk = min(400, FEISHU_VALUES_MAX_ROWS)
+    for i in range(0, len(values), row_chunk):
+        row_block = values[i : i + row_chunk]
         start = i + data_start_row
-        end = start + len(chunk) - 1
-        ok, err = _put_sheets_range(
-            spreadsheet_token,
-            sheet_id,
-            f"A{start}:{last_col}{end}",
-            chunk,
-            token,
-        )
-        if not ok:
-            return False, f"写入数据失败（{start}-{end}）：{err}"
+        end = start + len(row_block) - 1
+        for c0 in range(0, ncols, FEISHU_VALUES_MAX_COLS):
+            c1 = min(c0 + FEISHU_VALUES_MAX_COLS, ncols)
+            lo = _col_idx_to_letter(c0)
+            hi = _col_idx_to_letter(c1 - 1)
+            sub = [row[c0:c1] for row in row_block]
+            ok, err = _put_sheets_range(
+                spreadsheet_token,
+                sheet_id,
+                f"{lo}{start}:{hi}{end}",
+                sub,
+                token,
+            )
+            if not ok:
+                return False, f"写入数据失败（{lo}{start}:{hi}{end}）：{err}"
 
     # 2) 清空尾部旧数据（仅清空，不删行）
     new_rows = len(values)
     if old_rows > new_rows:
         blank_rows = old_rows - new_rows
         start = data_start_row + new_rows
-        end = data_start_row + old_rows - 1
         blanks = [["" for _ in target_cols] for _ in range(blank_rows)]
-        for i in range(0, len(blanks), chunk_size):
-            chunk = blanks[i : i + chunk_size]
+        for i in range(0, len(blanks), row_chunk):
+            chunk = blanks[i : i + row_chunk]
             s = start + i
             e = s + len(chunk) - 1
-            ok, err = _put_sheets_range(
-                spreadsheet_token,
-                sheet_id,
-                f"A{s}:{last_col}{e}",
-                chunk,
-                token,
-            )
-            if not ok:
-                return False, f"清空旧尾部失败（{s}-{e}）：{err}"
+            for c0 in range(0, ncols, FEISHU_VALUES_MAX_COLS):
+                c1 = min(c0 + FEISHU_VALUES_MAX_COLS, ncols)
+                lo = _col_idx_to_letter(c0)
+                hi = _col_idx_to_letter(c1 - 1)
+                sub = [row[c0:c1] for row in chunk]
+                ok, err = _put_sheets_range(
+                    spreadsheet_token,
+                    sheet_id,
+                    f"{lo}{s}:{hi}{e}",
+                    sub,
+                    token,
+                )
+                if not ok:
+                    return False, f"清空旧尾部失败（{lo}{s}:{hi}{e}）：{err}"
 
     _set_last_error("")
     return True, f"已写回飞书电子表格，共 {len(values)} 条。"
