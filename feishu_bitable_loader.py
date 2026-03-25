@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import math
 from typing import Optional
+from datetime import datetime
 
 import pandas as pd
 
@@ -759,8 +760,68 @@ def load_from_bitable(url_or_id: str, load_all_sheets: bool = False) -> pd.DataF
     return pd.DataFrame(all_records)
 
 
-def _normalize_cell_for_feishu(v) -> object:
-    """飞书 values 校验不接受 NaN/部分 numpy 标量；JSON 也需合法。"""
+# 写回时绝不能把「日期」列里的数字当普通数传给飞书，否则易显示成 J3+7 等异常文本；金额/序号列保持数字
+_FEISHU_AMOUNT_OR_ID_COLS = frozenset(
+    {
+        "序号",
+        "实际预计金额",
+        "上报预算金额",
+        "拟定金额",
+    }
+)
+
+
+def _column_is_timeline_like_for_write(col_name: str) -> bool:
+    """是否应按「日期」语义写字符串（含 Excel 序列号转 YYYY-MM-DD）。避免「项目名称」等含「立项」子串被误判。"""
+    s = str(col_name or "").strip()
+    if not s or s in _FEISHU_AMOUNT_OR_ID_COLS:
+        return False
+    if s in _TIMELINE_HEADER_TOKENS:
+        return True
+    if s.startswith("验收") or s.startswith("结算"):
+        return True
+    for k in (
+        "需求审核",
+        "需求立项",
+        "规划设计",
+        "成本核算",
+        "项目决策",
+        "文字说明",
+        "形成方案",
+        "运保总部",
+        "上联席会",
+        "立项呈批",
+        "预算动支",
+        "招采",
+        "实施",
+    ):
+        if k in s:
+            return True
+    return False
+
+
+def _excel_serial_to_date_str(v) -> str | None:
+    """将 Excel 日期序列号转为 YYYY-MM-DD；失败则返回 None。"""
+    try:
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        if abs(x - round(x)) > 1e-5:
+            return None
+        iv = int(round(x))
+        # 约 1995–2050 的常见序列号区间；避免把金额 50000 当日期（见下方列名判断）
+        if iv < 33000 or iv > 55000:
+            return None
+        dt = pd.to_datetime(iv, unit="D", origin="1899-12-30", errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _normalize_cell_for_feishu(v, column_name: str = "") -> object:
+    """飞书单元格：NaN/非法标量清理；日期列禁止传裸序列号（否则飞书可能显示为 J3+7 等）。"""
     if v is None:
         return ""
     try:
@@ -776,9 +837,42 @@ def _normalize_cell_for_feishu(v) -> object:
     if isinstance(v, float):
         if math.isnan(v) or math.isinf(v):
             return ""
-    if isinstance(v, (int, float, bool)):
+    if isinstance(v, pd.Timestamp):
+        try:
+            if pd.isna(v):
+                return ""
+            return v.strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+
+    is_date_col = _column_is_timeline_like_for_write(column_name)
+
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if is_date_col:
+            ds = _excel_serial_to_date_str(v)
+            if ds:
+                return ds
+            # 小整数可能是误标；仍输出为字符串避免飞书误解析
+            if isinstance(v, float) and v == int(v) and -1e9 < v < 1e9:
+                return str(int(v))
+            return str(v)
         return v
-    return str(v)
+
+    if isinstance(v, bool):
+        return v
+
+    s = str(v)
+    # 日期列若已是合法日期串，保持
+    if is_date_col:
+        st = s.strip()
+        # 疑似错误展示的「列字母+行+偏移」不原样写回
+        if re.fullmatch(r"[A-Z]{1,3}\d+\+\d+", st):
+            return ""
+        return st
+
+    return s
 
 
 def _col_idx_to_letter(idx: int) -> str:
@@ -814,6 +908,34 @@ def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: li
     )
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") == 0:
+            return True, ""
+        return False, f"code={data.get('code')} msg={data.get('msg')}"
+    except Exception as e:
+        return False, _format_http_error(e)
+
+
+def _post_values_batch_update(
+    spreadsheet_token: str, token: str, value_ranges: list
+) -> tuple[bool, str]:
+    """一次请求写入多个不重叠范围，避免多次 PUT 导致飞书端展示异常。"""
+    if not value_ranges:
+        return True, ""
+    body = {"valueRanges": value_ranges}
+    body_bytes = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode())
         if data.get("code") == 0:
             return True, ""
@@ -977,7 +1099,7 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         for tc in target_cols:
             src = _resolve_source_col(tc)
             v = row.get(src, "") if src else ""
-            one.append(_normalize_cell_for_feishu(v))
+            one.append(_normalize_cell_for_feishu(v, tc))
         values.append(one)
     if not values:
         return False, "写回数据为空（过滤后无可写入行）。"
@@ -987,20 +1109,21 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         row_block = values[i : i + row_chunk]
         start = i + data_start_row
         end = start + len(row_block) - 1
+        value_ranges = []
         for c0 in range(0, ncols, FEISHU_VALUES_MAX_COLS):
             c1 = min(c0 + FEISHU_VALUES_MAX_COLS, ncols)
             lo = _col_idx_to_letter(c0)
             hi = _col_idx_to_letter(c1 - 1)
             sub = [row[c0:c1] for row in row_block]
-            ok, err = _put_sheets_range(
-                spreadsheet_token,
-                sheet_id,
-                f"{lo}{start}:{hi}{end}",
-                sub,
-                token,
+            value_ranges.append(
+                {
+                    "range": _sheet_join_range(sheet_id, f"{lo}{start}:{hi}{end}"),
+                    "values": sub,
+                }
             )
-            if not ok:
-                return False, f"写入数据失败（{lo}{start}:{hi}{end}）：{err}"
+        ok, err = _post_values_batch_update(spreadsheet_token, token, value_ranges)
+        if not ok:
+            return False, f"写入数据失败（行 {start}-{end}）：{err}"
 
     # 2) 清空尾部旧数据（仅清空，不删行）
     new_rows = len(values)
@@ -1012,20 +1135,21 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
             chunk = blanks[i : i + row_chunk]
             s = start + i
             e = s + len(chunk) - 1
+            value_ranges = []
             for c0 in range(0, ncols, FEISHU_VALUES_MAX_COLS):
                 c1 = min(c0 + FEISHU_VALUES_MAX_COLS, ncols)
                 lo = _col_idx_to_letter(c0)
                 hi = _col_idx_to_letter(c1 - 1)
                 sub = [row[c0:c1] for row in chunk]
-                ok, err = _put_sheets_range(
-                    spreadsheet_token,
-                    sheet_id,
-                    f"{lo}{s}:{hi}{e}",
-                    sub,
-                    token,
+                value_ranges.append(
+                    {
+                        "range": _sheet_join_range(sheet_id, f"{lo}{s}:{hi}{e}"),
+                        "values": sub,
+                    }
                 )
-                if not ok:
-                    return False, f"清空旧尾部失败（{lo}{s}:{hi}{e}）：{err}"
+            ok, err = _post_values_batch_update(spreadsheet_token, token, value_ranges)
+            if not ok:
+                return False, f"清空旧尾部失败（行 {s}-{e}）：{err}"
 
     _set_last_error("")
     return True, f"已写回飞书电子表格，共 {len(values)} 条。"
