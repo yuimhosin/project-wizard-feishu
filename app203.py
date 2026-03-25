@@ -25,11 +25,13 @@ try:
         get_last_error as get_bitable_last_error,
         list_sheets_from_sheets_url,
         sync_sheets_full_replace,
+        FEISHU_RECORD_ID_COL,
     )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
     sync_sheets_full_replace = None  # type: ignore
+    FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
 PRESET_COMMUNITIES = sorted([str(x).strip() for x in 园区_TO_城市.keys() if str(x).strip()])
@@ -424,10 +426,13 @@ def load_from_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def save_to_db(df: pd.DataFrame):
-    """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。"""
+def save_to_db(df: pd.DataFrame) -> bool:
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。
+
+    返回 True：无需写回或飞书写回成功；False：本地已写入但飞书写回失败（详见 session feishu_sync_last_error）。
+    """
     if df is None or df.empty:
-        return
+        return True
     df = _dedupe_columns(df)
     engine = _get_db_engine()
     # 用事务保证 replace 的一致性
@@ -437,43 +442,43 @@ def save_to_db(df: pd.DataFrame):
         url = str(st.session_state.get("feishu_bitable_url") or "").strip()
     except Exception:
         url = ""
-    if "/sheets/" in url and sync_sheets_full_replace is not None:
+    if "/sheets/" not in url or sync_sheets_full_replace is None:
+        return True
+    df_sync = df
+    target_park = ""
+    try:
+        m_sid = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", url)
+        sid = m_sid.group(1).strip() if m_sid else ""
+        sheet_name = ""
+        if sid:
+            meta = st.session_state.get("feishu_sheets_meta") or []
+            for x in meta:
+                if str(x.get("sheet_id") or "").strip() == sid:
+                    sheet_name = str(x.get("sheet_name") or "").strip()
+                    break
+        current_park = str(st.session_state.get("feishu_current_park") or "").strip()
+        target_park = current_park or sheet_name
+        if target_park and "园区" in df.columns:
+            sub = df[df["园区"].astype(str).str.strip() == target_park].copy()
+            if not sub.empty:
+                df_sync = sub
+    except Exception:
         df_sync = df
-        target_park = ""
-        try:
-            # 关键修复：当前 URL 指向单个分表时，只回写该分表对应园区的数据，避免把多园区整表写进一个分表
-            m_sid = re.search(r"[?&]sheet=([A-Za-z0-9_]+)", url)
-            sid = m_sid.group(1).strip() if m_sid else ""
-            sheet_name = ""
-            if sid:
-                meta = st.session_state.get("feishu_sheets_meta") or []
-                for x in meta:
-                    if str(x.get("sheet_id") or "").strip() == sid:
-                        sheet_name = str(x.get("sheet_name") or "").strip()
-                        break
-            # 兜底：优先使用当前步骤中已确定的园区
-            current_park = str(st.session_state.get("feishu_current_park") or "").strip()
-            target_park = current_park or sheet_name
-            if target_park and "园区" in df.columns:
-                sub = df[df["园区"].astype(str).str.strip() == target_park].copy()
-                if not sub.empty:
-                    df_sync = sub
-        except Exception:
-            df_sync = df
-        try:
-            park_preview = target_park or "（未识别，按当前数据集）"
-            st.info(f"写回前预览：当前将写回园区={park_preview}、条数={len(df_sync)}")
-        except Exception:
-            pass
-        ok, msg = sync_sheets_full_replace(url, df_sync)
-        try:
-            if ok:
-                st.session_state["feishu_sync_last_ok"] = msg
-                st.session_state["feishu_sync_last_error"] = ""
-            else:
-                st.session_state["feishu_sync_last_error"] = msg
-        except Exception:
-            pass
+    try:
+        park_preview = target_park or "（未识别，按当前数据集）"
+        st.info(f"写回前预览：当前将写回园区={park_preview}、条数={len(df_sync)}")
+    except Exception:
+        pass
+    ok, msg = sync_sheets_full_replace(url, df_sync)
+    try:
+        if ok:
+            st.session_state["feishu_sync_last_ok"] = msg
+            st.session_state["feishu_sync_last_error"] = ""
+        else:
+            st.session_state["feishu_sync_last_error"] = msg
+    except Exception:
+        pass
+    return bool(ok)
 
 
 def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -498,7 +503,8 @@ def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     out_idx = []
     for i, c in enumerate(out.columns):
         cs = str(c).strip()
-        if cs.startswith("__"):
+        # 保留飞书表格物理行号，写回时必须按此排序对齐，否则会整表错位、表现为「改了没反应」
+        if cs.startswith("__") and cs != FEISHU_RECORD_ID_COL:
             continue
         if re.fullmatch(r"列\d+", cs):
             # 按位置取列，规避重复列名时 out[c] 返回 DataFrame
@@ -5721,14 +5727,18 @@ def _render_project_wizard(df: pd.DataFrame):
                 if row_id in df_new.index:
                     df_new = df_new.drop(index=row_id)
                 with st.spinner("正在保存删除结果并同步飞书..."):
-                    save_to_db(df_new)
-                if _get_feishu_webhook_url():
-                    diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
-                    payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
-                    push_to_feishu(payload=payload)
-                st.session_state["ui_save_last_ok"] = "删除成功，数据已保存。"
-                st.success(f"已删除项目（园区：{园区}，序号：{seq_val or '未知'}）。")
-                st.rerun()
+                    feishu_ok = save_to_db(df_new)
+                if not feishu_ok:
+                    err_detail = st.session_state.get("feishu_sync_last_error") or ""
+                    st.error(f"本地已从数据库删除该条，但飞书表格写回失败。{err_detail}")
+                else:
+                    if _get_feishu_webhook_url():
+                        diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
+                        payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
+                        push_to_feishu(payload=payload)
+                    st.session_state["ui_save_last_ok"] = "删除成功，数据已保存。"
+                    st.success(f"已删除项目（园区：{园区}，序号：{seq_val or '未知'}）。")
+                    st.rerun()
 
         st.markdown("#### 更改项目进度")
         timeline_opts = ["（不修改进度）"] + list(TIMELINE_COLS)
@@ -5765,26 +5775,30 @@ def _render_project_wizard(df: pd.DataFrame):
                 if row_id in df_new.index:
                     df_new.loc[row_id, target_timeline_col] = _date_to_str(new_date)
                 with st.spinner("正在保存进度并同步飞书..."):
-                    save_to_db(df_new)
-                if _get_feishu_webhook_url():
-                    modified_row = df_new.loc[row_id]
-                    changes = [
-                        f"{chosen_timeline_col}："
-                        f"{_format_cell(target_row.get(target_timeline_col, '')) or '（空）'} → "
-                        f"{_format_cell(modified_row.get(target_timeline_col, '')) or '（空）'}"
-                    ]
-                    modified_details = [{"序号": seq_val, "变更项": changes}]
-                    diff = {
-                        "deleted": [],
-                        "added": [],
-                        "modified": [_row_to_dict(modified_row)],
-                        "modified_details": modified_details,
-                    }
-                    payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-进度")
-                    push_to_feishu(payload=payload)
-                st.session_state["ui_save_last_ok"] = "进度修改已保存。"
-                st.success("已保存进度更改。")
-                st.rerun()
+                    feishu_ok = save_to_db(df_new)
+                if not feishu_ok:
+                    err_detail = st.session_state.get("feishu_sync_last_error") or ""
+                    st.error(f"本地已保存进度，但飞书表格写回失败。{err_detail}")
+                else:
+                    if _get_feishu_webhook_url():
+                        modified_row = df_new.loc[row_id]
+                        changes = [
+                            f"{chosen_timeline_col}："
+                            f"{_format_cell(target_row.get(target_timeline_col, '')) or '（空）'} → "
+                            f"{_format_cell(modified_row.get(target_timeline_col, '')) or '（空）'}"
+                        ]
+                        modified_details = [{"序号": seq_val, "变更项": changes}]
+                        diff = {
+                            "deleted": [],
+                            "added": [],
+                            "modified": [_row_to_dict(modified_row)],
+                            "modified_details": modified_details,
+                        }
+                        payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-进度")
+                        push_to_feishu(payload=payload)
+                    st.session_state["ui_save_last_ok"] = "进度修改已保存。"
+                    st.success("已保存进度更改。")
+                    st.rerun()
 
         st.markdown("---")
         st.markdown("#### 项目信息更改")
@@ -5899,29 +5913,33 @@ def _render_project_wizard(df: pd.DataFrame):
                             df_new.loc[row_id, "城市"] = matched_city or df_new.loc[row_id, "城市"]
 
                     with st.spinner("正在保存项目信息并同步飞书..."):
-                        save_to_db(df_new)
-                    if _get_feishu_webhook_url():
-                        modified_row = df_new.loc[row_id]
-                        changes = []
-                        for col in target_row.index:
-                            if col not in modified_row.index:
-                                continue
-                            ov = _format_cell(target_row[col])
-                            nv = _format_cell(modified_row[col])
-                            if ov != nv:
-                                changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
-                        modified_details = [{"序号": seq_val, "变更项": changes}]
-                        diff = {
-                            "deleted": [],
-                            "added": [],
-                            "modified": [_row_to_dict(modified_row)],
-                            "modified_details": modified_details,
-                        }
-                        payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-信息")
-                        push_to_feishu(payload=payload)
-                    st.session_state["ui_save_last_ok"] = "项目信息修改已保存。"
-                    st.success("已保存项目信息更改。")
-                    st.rerun()
+                        feishu_ok = save_to_db(df_new)
+                    if not feishu_ok:
+                        err_detail = st.session_state.get("feishu_sync_last_error") or ""
+                        st.error(f"本地已保存项目信息，但飞书表格写回失败。{err_detail}")
+                    else:
+                        if _get_feishu_webhook_url():
+                            modified_row = df_new.loc[row_id]
+                            changes = []
+                            for col in target_row.index:
+                                if col not in modified_row.index:
+                                    continue
+                                ov = _format_cell(target_row[col])
+                                nv = _format_cell(modified_row[col])
+                                if ov != nv:
+                                    changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+                            modified_details = [{"序号": seq_val, "变更项": changes}]
+                            diff = {
+                                "deleted": [],
+                                "added": [],
+                                "modified": [_row_to_dict(modified_row)],
+                                "modified_details": modified_details,
+                            }
+                            payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改-信息")
+                            push_to_feishu(payload=payload)
+                        st.session_state["ui_save_last_ok"] = "项目信息修改已保存。"
+                        st.success("已保存项目信息更改。")
+                        st.rerun()
         return
 
     # ---------- 新增项目 ----------
@@ -6051,15 +6069,19 @@ def _render_project_wizard(df: pd.DataFrame):
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
         with st.spinner("正在保存新增项目并同步飞书..."):
-            save_to_db(df_all2)
-        if _get_feishu_webhook_url():
-            diff = {"deleted": [], "added": [_row_to_dict(df_new_row.iloc[0])], "modified": []}
-            payload = _build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
-            push_to_feishu(payload=payload)
-        st.session_state["ui_save_last_ok"] = "新增项目已保存。"
-        st.success(f"已写入数据库。上传凭证：{token}")
-        st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
-        st.rerun()
+            feishu_ok = save_to_db(df_all2)
+        if not feishu_ok:
+            err_detail = st.session_state.get("feishu_sync_last_error") or ""
+            st.error(f"本地已写入新项目，但飞书表格写回失败。{err_detail}")
+        else:
+            if _get_feishu_webhook_url():
+                diff = {"deleted": [], "added": [_row_to_dict(df_new_row.iloc[0])], "modified": []}
+                payload = _build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
+                push_to_feishu(payload=payload)
+            st.session_state["ui_save_last_ok"] = "新增项目已保存。"
+            st.success(f"已写入数据库。上传凭证：{token}")
+            st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
+            st.rerun()
 
 
 def _require_feishu_login() -> bool:

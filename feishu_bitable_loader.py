@@ -934,6 +934,16 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
             ).drop(columns=["_feishu_sheet_row"])
         except Exception:
             df_write = df_new
+    elif "序号" in df_write.columns:
+        # 历史数据若没有行号列，至少按序号排序，避免乱序覆盖整表
+        try:
+            df_write = df_write.copy()
+            df_write["_feishu_sort_seq"] = pd.to_numeric(df_write["序号"], errors="coerce")
+            df_write = df_write.sort_values(
+                "_feishu_sort_seq", kind="mergesort", na_position="last"
+            ).drop(columns=["_feishu_sort_seq"])
+        except Exception:
+            df_write = df_new
 
     values = []
     for _, row in df_write.iterrows():
