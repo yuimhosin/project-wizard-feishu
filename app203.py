@@ -466,8 +466,8 @@ def save_to_db(
 ) -> bool:
     """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。
 
-    feishu_cells: 若提供非空列表，每项含 sheet_row、column_name、value，则批量更新飞书对应单元格（非整表覆盖）。
-    feishu_single_cell: 若提供且含 sheet_row、column_name、value，则仅更新飞书该单元格（不整表覆盖）。
+    feishu_cells: 若提供非空列表，每项含 sheet_row、column_name、value，则批量更新飞书对应单元格。
+    feishu_single_cell: 若提供且含 sheet_row、column_name、value，则仅更新飞书该单元格。
     优先级：feishu_cells（非空）> feishu_single_cell > 整表覆盖。feishu_cells=[] 表示仅写库、不写飞书。
     返回 True：无需写回或飞书写回成功；False：本地已写入但飞书写回失败（详见 session feishu_sync_last_error）。
     """
@@ -528,7 +528,7 @@ def save_to_db(
                 val = c.get("value")
                 cells_tuples.append((sr, coln, val))
             st.info(
-                f"写回前预览：仅更新飞书 {len(cells_tuples)} 个单元格（非整表覆盖）"
+                f"写回前预览：仅更新飞书 {len(cells_tuples)} 个单元格"
             )
         except Exception:
             cells_tuples = []
