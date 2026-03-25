@@ -1110,6 +1110,82 @@ def _ensure_sheet_column_actual_amount(
     return True, ""
 
 
+_YANYUAN_GAP_LEFT_ANCHOR = "上联席会"
+_YANYUAN_GAP_RIGHT_ANCHOR = "立项呈批"
+# 燕园「更改项目进度」下拉列表前几项：当列在飞书表头中找不到时，按你要求插入到“上联席会”和“立项呈批”之间
+_YANYUAN_GAP_INSERT_TARGETS = {"文字说明及构思", "形成方案", "运保总部审核"}
+
+
+def _strip_suffix_num(s: str) -> str:
+    return re.sub(r"_\d+$", "", str(s).strip())
+
+
+def _col_base_name_matches(col_name: str, base_name: str) -> bool:
+    return _strip_suffix_num(col_name) == _strip_suffix_num(base_name)
+
+
+def _find_col_index_by_base_name(target_cols: list[str], base_name: str) -> int | None:
+    for i, tc in enumerate(target_cols):
+        if _col_base_name_matches(str(tc), base_name):
+            return i
+    return None
+
+
+def _ensure_sheet_column_yanyuan_gap_insert(
+    spreadsheet_token: str,
+    sheet_id: str,
+    token: str,
+    target_cols: list[str],
+    df_column_name: str,
+) -> tuple[bool, str]:
+    """
+    燕园场景：当某个「进度节点」列在表头里找不到时，尝试在
+    「上联席会」与「立项呈批」之间插入一列，并写入表头（第1行空、第2行节点名）。
+    """
+    if str(df_column_name).strip() not in _YANYUAN_GAP_INSERT_TARGETS:
+        return False, "非燕园插入目标列"
+
+    left_idx = _find_col_index_by_base_name(target_cols, _YANYUAN_GAP_LEFT_ANCHOR)
+    right_idx = _find_col_index_by_base_name(target_cols, _YANYUAN_GAP_RIGHT_ANCHOR)
+    if left_idx is None or right_idx is None:
+        return False, "燕园锚点列缺失，无法插入"
+    # 如果右锚点已经紧贴左锚点，则插入位置等于右锚点
+    ins_idx = left_idx + 1 if left_idx + 1 <= right_idx else right_idx
+
+    cc_max = _get_sheet_grid_column_count(spreadsheet_token, sheet_id, token)
+    ins_end = ins_idx + 1
+    if cc_max is not None and ins_end > cc_max:
+        # 兜底：插入越界则退化到末尾增加
+        ok_add, err_add = _post_add_dimension_columns(spreadsheet_token, sheet_id, 1, token)
+        if not ok_add:
+            return False, f"插入到燕园列间失败且末尾增加也失败：{err_add}"
+        letter = _col_idx_to_letter(cc_max)
+    else:
+        ok_ins, err_ins = _post_insert_dimension_range(
+            spreadsheet_token,
+            sheet_id,
+            "COLUMNS",
+            ins_idx,
+            ins_end,
+            token,
+            inherit_style="BEFORE",
+        )
+        if not ok_ins:
+            return False, f"插入燕园列间失败：{err_ins}"
+        letter = _col_idx_to_letter(ins_idx)
+
+    # 写表头：第1行置空，第2行写节点名；合并表头时会优先采用第2行（若在 tokens 中）
+    node_name = _norm_sheet_header_paren(df_column_name)
+    ok1, err1 = _put_sheets_range(spreadsheet_token, sheet_id, f"{letter}1:{letter}1", [[""]], token)
+    if not ok1:
+        return False, f"写入燕园节点表头第1行失败：{err1}"
+    ok2, err2 = _put_sheets_range(spreadsheet_token, sheet_id, f"{letter}2:{letter}2", [[node_name]], token)
+    if not ok2:
+        return False, f"写入燕园节点表头第2行失败：{err2}"
+
+    return True, ""
+
+
 def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: list, token: str) -> tuple[bool, str]:
     body = {
         "valueRange": {
@@ -1198,21 +1274,24 @@ def _find_sheet_column_index_for_df_column(
     target_cols: list[str], source_cols: list[str], df_column_name: str
 ) -> int | None:
     """在合并后的表头列序列中，找到与 df 列名对应的那一列索引（0-based）。"""
+    def _strip_suffix_num(s: str) -> str:
+        return re.sub(r"_\d+$", "", str(s).strip())
+
     dfn = str(df_column_name).strip()
     candidates: list[int] = []
     for i, tc in enumerate(target_cols):
-        if str(tc).strip() == dfn:
+        if _strip_suffix_num(tc) == _strip_suffix_num(dfn):
             candidates.append(i)
     if not candidates:
         for i, tc in enumerate(target_cols):
             src = _resolve_df_column_for_sheet_header(tc, source_cols)
-            if src == dfn:
+            if src is not None and _strip_suffix_num(src) == _strip_suffix_num(dfn):
                 candidates.append(i)
     if not candidates:
         dfn_base = re.sub(r"[（(].*?[)）]", "", dfn).strip()
         for i, tc in enumerate(target_cols):
             tcb = re.sub(r"[（(].*?[)）]", "", str(tc)).strip()
-            if tcb and dfn_base and tcb == dfn_base:
+            if tcb and dfn_base and _strip_suffix_num(tcb) == _strip_suffix_num(dfn_base):
                 candidates.append(i)
     if not candidates:
         return None
@@ -1323,6 +1402,19 @@ def sync_sheets_update_single_cell(
             target_cols, source_cols, df_column_name
         )
     if idx is None:
+        if str(df_column_name).strip() in _YANYUAN_GAP_INSERT_TARGETS:
+            ok_ins, _ = _ensure_sheet_column_yanyuan_gap_insert(
+                spreadsheet_token, sheet_id, token, target_cols, df_column_name
+            )
+            if ok_ins:
+                target_cols, ferr = _fetch_merged_target_cols_for_write(
+                    spreadsheet_token, sheet_id, token
+                )
+                if ferr:
+                    return False, ferr
+                idx = _find_sheet_column_index_for_df_column(
+                    target_cols, source_cols, df_column_name
+                )
         return (
             False,
             f"无法在飞书表头中定位与「{df_column_name}」对应的列，请改用整表同步或检查列名。",
@@ -1389,6 +1481,7 @@ def sync_sheets_update_cells_batch(
 
     skipped: list[str] = []
     value_ranges: list[dict] = []
+    ensured_cols: set[str] = set()
     for sheet_row_1based, df_column_name, raw_value in cells:
         if sheet_row_1based < 1:
             return False, f"无效的数据行号：{sheet_row_1based}"
@@ -1396,6 +1489,32 @@ def sync_sheets_update_cells_batch(
             target_cols, source_cols, df_column_name
         )
         if idx is None:
+            col_key = str(df_column_name).strip()
+            if col_key in _YANYUAN_GAP_INSERT_TARGETS and col_key not in ensured_cols:
+                ok_ins, _ = _ensure_sheet_column_yanyuan_gap_insert(
+                    spreadsheet_token, sheet_id, token, target_cols, df_column_name
+                )
+                if ok_ins:
+                    ensured_cols.add(col_key)
+                    target_cols, ferr = _fetch_merged_target_cols_for_write(
+                        spreadsheet_token, sheet_id, token
+                    )
+                    if ferr:
+                        return False, ferr
+                    idx = _find_sheet_column_index_for_df_column(
+                        target_cols, source_cols, df_column_name
+                    )
+            if idx is not None:
+                letter = _col_idx_to_letter(idx)
+                cell = _normalize_cell_for_feishu(raw_value, df_column_name)
+                a1 = f"{letter}{sheet_row_1based}:{letter}{sheet_row_1based}"
+                value_ranges.append(
+                    {
+                        "range": _sheet_join_range(sheet_id, a1),
+                        "values": [[cell]],
+                    }
+                )
+                continue
             skipped.append(str(df_column_name).strip())
             continue
         letter = _col_idx_to_letter(idx)
