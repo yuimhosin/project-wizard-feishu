@@ -377,50 +377,11 @@ def _date_input_cn(
     key: str,
 ) -> date:
     """
-    日期选择器（中文月份/星期）：
-    - 若安装了 streamlit-dateinput-intl，则用其 locale=zh-cn
-    - 否则回退到 st.date_input
+    日期选择器。
+
+    说明：当前不依赖 streamlit-dateinput-intl（它在该环境的组件加载会报错）。
+    页面端通过 JS 把原生 date_input 的月份/星期文案替换为中文，从而实现“中文日历”显示。
     """
-    missing_key = "dateinput_intl_missing_notice_shown"
-    fallback_key = "dateinput_intl_fallback_notice_shown"
-
-    if not (_DATEINPUT_INTL_AVAILABLE and _dateinput_intl is not None):
-        if not st.session_state.get(missing_key):
-            st.warning("未启用中文日期日历控件（streamlit-dateinput-intl 不可用）。将使用默认英文日历。")
-            st.session_state[missing_key] = True
-        return st.date_input(
-            label,
-            value=value,
-            min_value=min_value,
-            max_value=max_value,
-            format="YYYY-MM-DD",
-            key=key,
-        )
-
-    # 组件对 locale 字符串兼容性不一；这里给常见中文 locale 做兜底尝试。
-    for loc in ("zh", "zh-CN", "zh-cn", "zh_cn", "cn"):
-        try:
-            v = _dateinput_intl(
-                value=value,
-                min=min_value,
-                max=max_value,
-                key=key,
-                format="YYYY-MM-DD",
-                locale=loc,
-                width="stretch",
-            )
-            # 正常情况应直接返回 date
-            if isinstance(v, date):
-                return v
-            d = _str_to_date(v)
-            return d if d != SENTINEL_DATE else value
-        except Exception:
-            continue
-
-    if not st.session_state.get(fallback_key):
-        st.warning("streamlit-dateinput-intl 启用但中文 locale 解析失败，已回退英文日历。")
-        st.session_state[fallback_key] = True
-
     return st.date_input(
         label,
         value=value,
@@ -6512,6 +6473,57 @@ def main():
 
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
+
+    # 将原生 st.date_input（底层 react-datepicker）月份/星期英文文案替换为中文。
+    # 使用 MutationObserver 处理日历展开/切换时机，尽量不影响选中日期逻辑。
+    st.markdown(
+        """
+        <script>
+        (function(){
+          if(window.__app203_datepicker_zh_installed) return;
+          window.__app203_datepicker_zh_installed = true;
+          const monthMap = {
+            "January":"一月","February":"二月","March":"三月","April":"四月","May":"五月","June":"六月",
+            "July":"七月","August":"八月","September":"九月","October":"十月","November":"十一月","December":"十二月",
+            "Jan":"1月","Feb":"2月","Mar":"3月","Apr":"4月","Jun":"6月","Jul":"7月","Aug":"8月","Sep":"9月","Oct":"10月","Nov":"11月","Dec":"12月"
+          };
+          const weekdayMap = {
+            "Mo":"周一","Tu":"周二","We":"周三","Th":"周四","Fr":"周五","Sa":"周六","Su":"周日",
+            "Mon":"周一","Tue":"周二","Wed":"周三","Thu":"周四","Fri":"周五","Sat":"周六","Sun":"周日"
+          };
+
+          function applyOnce(){
+            try {
+              // 月份下拉/当前月份标题
+              document.querySelectorAll(".react-datepicker__month-select option").forEach(opt=>{
+                const t = (opt.textContent||"").trim();
+                if(monthMap[t]) opt.textContent = monthMap[t];
+              });
+              document.querySelectorAll(".react-datepicker__current-month").forEach(el=>{
+                const t = (el.textContent||"").trim();
+                if(monthMap[t]) el.textContent = monthMap[t];
+                // 有些版本 current-month 可能是 "January 2026"
+                for(const k in monthMap){
+                  if(t.indexOf(k)>=0){ el.textContent = t.replace(k, monthMap[k]); break; }
+                }
+              });
+
+              // 星期标题
+              document.querySelectorAll(".react-datepicker__day-names span, .react-datepicker__day-names div, .react-datepicker__day-name").forEach(el=>{
+                const t = (el.textContent||"").trim();
+                if(weekdayMap[t]) el.textContent = weekdayMap[t];
+              });
+            } catch (e) {}
+          }
+
+          const obs = new MutationObserver(()=>applyOnce());
+          obs.observe(document.body, {subtree:true, childList:true, characterData:true});
+          setTimeout(applyOnce, 300);
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # 侧边栏：用户信息 + 数据源
     with st.sidebar:
