@@ -888,6 +888,93 @@ def _sheet_join_range(sheet_id: str, a1: str) -> str:
     return f"{sheet_id}!{a1}"
 
 
+def _post_insert_dimension_range(
+    spreadsheet_token: str,
+    sheet_id: str,
+    major_dimension: str,
+    start_index: int,
+    end_index: int,
+    token: str,
+    inherit_style: str | None = None,
+) -> tuple[bool, str]:
+    """在指定位置插入空白行或列。列：startIndex/endIndex 为 0 起计数，插入列数 = endIndex - startIndex。"""
+    dim: dict = {
+        "sheetId": sheet_id,
+        "majorDimension": major_dimension,
+        "startIndex": start_index,
+        "endIndex": end_index,
+    }
+    body: dict = {"dimension": dim}
+    if inherit_style:
+        body["inheritStyle"] = inherit_style
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/insert_dimension_range"
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("code") == 0:
+            return True, ""
+        return False, f"code={data.get('code')} msg={data.get('msg')}"
+    except Exception as e:
+        return False, _format_http_error(e)
+
+
+def _ensure_sheet_column_actual_amount(
+    spreadsheet_token: str,
+    sheet_id: str,
+    token: str,
+    source_cols: list[str],
+) -> tuple[bool, str]:
+    """
+    若合并表头中尚无法定位「实际预计金额」列，则在表尾插入一列并写入表头，便于后续单格或整表写回。
+    """
+    target_cols, ferr = _fetch_merged_target_cols_for_write(spreadsheet_token, sheet_id, token)
+    if ferr:
+        return False, ferr
+    if not target_cols:
+        return False, "目标表头为空，无法新增金额列。"
+
+    idx = _find_sheet_column_index_for_df_column(
+        target_cols, source_cols, "实际预计金额"
+    )
+    if idx is not None:
+        return True, ""
+
+    n = len(target_cols)
+    ok, err = _post_insert_dimension_range(
+        spreadsheet_token, sheet_id, "COLUMNS", n, n + 1, token, inherit_style="BEFORE"
+    )
+    if not ok:
+        return False, f"插入「实际预计金额」列失败：{err}"
+
+    letter = _col_idx_to_letter(n)
+    hdr = [["实际预计金额"]]
+    ok2, err2 = _put_sheets_range(
+        spreadsheet_token, sheet_id, f"{letter}1:{letter}1", hdr, token
+    )
+    if not ok2:
+        return False, f"写入金额列表头失败：{err2}"
+
+    data_start = _detect_sheet_data_start_row(spreadsheet_token, sheet_id, token)
+    if data_start >= 3:
+        ok3, err3 = _put_sheets_range(
+            spreadsheet_token, sheet_id, f"{letter}2:{letter}2", [[""]], token
+        )
+        if not ok3:
+            return False, f"写入表头第二行失败：{err3}"
+
+    return True, ""
+
+
 def _put_sheets_range(spreadsheet_token: str, sheet_id: str, a1: str, values: list, token: str) -> tuple[bool, str]:
     body = {
         "valueRange": {
@@ -1055,6 +1142,22 @@ def sync_sheets_update_single_cell(
         return False, "目标表头为空。"
 
     idx = _find_sheet_column_index_for_df_column(target_cols, source_cols, df_column_name)
+    if idx is None and str(df_column_name).strip() == "实际预计金额":
+        ok_ins, e = _ensure_sheet_column_actual_amount(
+            spreadsheet_token, sheet_id, token, source_cols
+        )
+        if not ok_ins:
+            return False, e or "无法新增金额列"
+        target_cols, ferr = _fetch_merged_target_cols_for_write(
+            spreadsheet_token, sheet_id, token
+        )
+        if ferr:
+            return False, ferr
+        if not target_cols:
+            return False, "目标表头为空。"
+        idx = _find_sheet_column_index_for_df_column(
+            target_cols, source_cols, df_column_name
+        )
     if idx is None:
         return (
             False,
@@ -1141,6 +1244,24 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         target_cols = [str(c).strip() for c in source_cols if str(c).strip()]
     if not target_cols:
         return False, "目标表头为空，无法写回。"
+
+    if "实际预计金额" in source_cols:
+        idx_amt = _find_sheet_column_index_for_df_column(
+            target_cols, source_cols, "实际预计金额"
+        )
+        if idx_amt is None:
+            ok_amt, err_amt = _ensure_sheet_column_actual_amount(
+                spreadsheet_token, sheet_id, token, source_cols
+            )
+            if not ok_amt:
+                return False, err_amt
+            target_cols, hdr_err = _fetch_merged_target_cols_for_write(
+                spreadsheet_token, sheet_id, token
+            )
+            if hdr_err:
+                return False, hdr_err
+            if not target_cols:
+                return False, "新增金额列后重读表头失败。"
 
     # 探测原始分表的数据起始行（有些分表是多行表头，不一定从第2行开始）
     data_start_row = _detect_sheet_data_start_row(spreadsheet_token, sheet_id, token)
