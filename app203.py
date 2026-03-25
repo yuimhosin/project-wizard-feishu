@@ -25,12 +25,14 @@ try:
         get_last_error as get_bitable_last_error,
         list_sheets_from_sheets_url,
         sync_sheets_full_replace,
+        sync_sheets_update_single_cell,
         FEISHU_RECORD_ID_COL,
     )
     FEISHU_BITABLE_AVAILABLE = True
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
     sync_sheets_full_replace = None  # type: ignore
+    sync_sheets_update_single_cell = None  # type: ignore
     FEISHU_RECORD_ID_COL = "__feishu_record_id"
 
 # 预置社区结构：用于首屏快速展示社区筛选，避免首次打开就请求飞书全量结构
@@ -426,9 +428,10 @@ def load_from_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def save_to_db(df: pd.DataFrame) -> bool:
+def save_to_db(df: pd.DataFrame, *, feishu_single_cell: dict | None = None) -> bool:
     """将当前 DataFrame 全量写入数据库（覆盖 projects 表），并在可用时写回飞书 Sheets。
 
+    feishu_single_cell: 若提供且含 sheet_row、column_name、value，则仅更新飞书该单元格（不整表覆盖）。
     返回 True：无需写回或飞书写回成功；False：本地已写入但飞书写回失败（详见 session feishu_sync_last_error）。
     """
     if df is None or df.empty:
@@ -464,9 +467,36 @@ def save_to_db(df: pd.DataFrame) -> bool:
                 df_sync = sub
     except Exception:
         df_sync = df
+
+    use_single = (
+        feishu_single_cell is not None
+        and sync_sheets_update_single_cell is not None
+        and feishu_single_cell.get("sheet_row") is not None
+        and feishu_single_cell.get("column_name") is not None
+    )
+    if use_single:
+        try:
+            sr = int(feishu_single_cell["sheet_row"])
+            coln = str(feishu_single_cell["column_name"]).strip()
+            val = feishu_single_cell.get("value")
+            st.info(f"写回前预览：仅更新飞书第 {sr} 行、列「{coln}」（单格，不覆盖整表）")
+        except Exception:
+            sr, coln, val = None, "", None
+        if sr is not None and coln:
+            ok, msg = sync_sheets_update_single_cell(url, df_sync, sr, coln, val)
+            try:
+                if ok:
+                    st.session_state["feishu_sync_last_ok"] = msg
+                    st.session_state["feishu_sync_last_error"] = ""
+                else:
+                    st.session_state["feishu_sync_last_error"] = msg
+            except Exception:
+                pass
+            return bool(ok)
+
     try:
         park_preview = target_park or "（未识别，按当前数据集）"
-        st.info(f"写回前预览：当前将写回园区={park_preview}、条数={len(df_sync)}")
+        st.info(f"写回前预览：当前将写回园区={park_preview}、条数={len(df_sync)}（整表覆盖）")
     except Exception:
         pass
     ok, msg = sync_sheets_full_replace(url, df_sync)
@@ -5774,8 +5804,20 @@ def _render_project_wizard(df: pd.DataFrame):
                     df_new[target_timeline_col] = ""
                 if row_id in df_new.index:
                     df_new.loc[row_id, target_timeline_col] = _date_to_str(new_date)
+                cell_val = _date_to_str(new_date)
+                feishu_single_cell = None
+                try:
+                    if FEISHU_RECORD_ID_COL in df_new.columns and row_id in df_new.index:
+                        _sr = int(float(str(df_new.loc[row_id, FEISHU_RECORD_ID_COL])))
+                        feishu_single_cell = {
+                            "sheet_row": _sr,
+                            "column_name": target_timeline_col,
+                            "value": cell_val,
+                        }
+                except Exception:
+                    feishu_single_cell = None
                 with st.spinner("正在保存进度并同步飞书..."):
-                    feishu_ok = save_to_db(df_new)
+                    feishu_ok = save_to_db(df_new, feishu_single_cell=feishu_single_cell)
                 if not feishu_ok:
                     err_detail = st.session_state.get("feishu_sync_last_error") or ""
                     st.error(f"本地已保存进度，但飞书表格写回失败。{err_detail}")

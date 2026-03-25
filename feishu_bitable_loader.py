@@ -944,6 +944,133 @@ def _post_values_batch_update(
         return False, _format_http_error(e)
 
 
+def _resolve_df_column_for_sheet_header(target_col: str, source_cols: list[str]) -> str | None:
+    """表头列名 → DataFrame 中对应列名（与 sync 写回逻辑一致）。"""
+    if target_col in source_cols:
+        return target_col
+    if target_col == "拟定金额" and "实际预计金额" in source_cols:
+        return "实际预计金额"
+    tc_base = re.sub(r"[（(].*?[)）]", "", str(target_col)).strip()
+    for sc in source_cols:
+        scs = str(sc).strip()
+        sc_base = re.sub(r"[（(].*?[)）]", "", scs).strip()
+        if scs == target_col or sc_base == tc_base:
+            return sc
+    return None
+
+
+def _find_sheet_column_index_for_df_column(
+    target_cols: list[str], source_cols: list[str], df_column_name: str
+) -> int | None:
+    """在合并后的表头列序列中，找到与 df 列名对应的那一列索引（0-based）。"""
+    dfn = str(df_column_name).strip()
+    for i, tc in enumerate(target_cols):
+        if str(tc).strip() == dfn:
+            return i
+    for i, tc in enumerate(target_cols):
+        src = _resolve_df_column_for_sheet_header(tc, source_cols)
+        if src == dfn:
+            return i
+    dfn_base = re.sub(r"[（(].*?[)）]", "", dfn).strip()
+    for i, tc in enumerate(target_cols):
+        tcb = re.sub(r"[（(].*?[)）]", "", str(tc)).strip()
+        if tcb and dfn_base and tcb == dfn_base:
+            return i
+    return None
+
+
+def _fetch_merged_target_cols_for_write(
+    spreadsheet_token: str, sheet_id: str, token: str
+) -> tuple[list[str], str | None]:
+    """
+    读取并合并第 1、2 行表头，返回 (target_cols, None)；失败返回 ([], 错误信息)。
+    """
+    try:
+        header_range = f"{sheet_id}!A1:ZZ1"
+        encoded_header = urllib.parse.quote(header_range, safe="")
+        header_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_header}"
+        req_header = urllib.request.Request(
+            header_url,
+            method="GET",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req_header, timeout=30) as resp:
+            header_data = json.loads(resp.read().decode())
+        if header_data.get("code") != 0:
+            return [], f"读取原表头失败：code={header_data.get('code')} msg={header_data.get('msg')}"
+        header_values = header_data.get("data", {}).get("valueRange", {}).get("values", []) or []
+        row1 = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
+        row2: list[str] = []
+        try:
+            h2_range = f"{sheet_id}!A2:ZZ2"
+            h2_enc = urllib.parse.quote(h2_range, safe="")
+            h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_enc}"
+            h2_req = urllib.request.Request(h2_url, method="GET", headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(h2_req, timeout=30) as resp:
+                h2_data = json.loads(resp.read().decode())
+            if h2_data.get("code") == 0:
+                h2_vals = (h2_data.get("data") or {}).get("valueRange", {}).get("values", []) or []
+                if h2_vals:
+                    row2 = [str(x).strip() if x is not None else "" for x in h2_vals[0]]
+        except Exception:
+            row2 = []
+        merged = _merge_sheet_header_rows(row1, row2)
+        target_cols = _dedupe_sheet_column_names(merged)
+        return target_cols, None
+    except Exception as e:
+        return [], f"读取原表头异常：{_format_http_error(e)}"
+
+
+def sync_sheets_update_single_cell(
+    url_or_id: str,
+    df_for_resolve: pd.DataFrame,
+    sheet_row_1based: int,
+    df_column_name: str,
+    raw_value,
+) -> tuple[bool, str]:
+    """
+    仅更新飞书表格中一个单元格（按合并表头定位列、按行号定位数据行）。
+    不整表覆盖，避免误伤其它列。
+    """
+    spreadsheet_token, sheet_id = _parse_sheets_url(url_or_id)
+    if not spreadsheet_token:
+        return False, "链接不是 sheets 地址，未执行电子表格写回。"
+    token = _get_tenant_access_token()
+    if not token:
+        return False, get_last_error() or "无法获取 tenant_access_token。"
+    if not sheet_id:
+        sheet_id = _get_first_sheet_id(spreadsheet_token, token) or ""
+    if not sheet_id:
+        return False, "无法解析 sheet_id。"
+    if sheet_row_1based < 1:
+        return False, f"无效的数据行号：{sheet_row_1based}"
+
+    source_cols = [
+        c for c in df_for_resolve.columns if str(c).strip() and not str(c).startswith("__")
+    ]
+    target_cols, ferr = _fetch_merged_target_cols_for_write(spreadsheet_token, sheet_id, token)
+    if ferr:
+        return False, ferr
+    if not target_cols:
+        return False, "目标表头为空。"
+
+    idx = _find_sheet_column_index_for_df_column(target_cols, source_cols, df_column_name)
+    if idx is None:
+        return (
+            False,
+            f"无法在飞书表头中定位与「{df_column_name}」对应的列，请改用整表同步或检查列名。",
+        )
+
+    letter = _col_idx_to_letter(idx)
+    cell = _normalize_cell_for_feishu(raw_value, df_column_name)
+    a1 = f"{letter}{sheet_row_1based}:{letter}{sheet_row_1based}"
+    ok, err = _put_sheets_range(spreadsheet_token, sheet_id, a1, [[cell]], token)
+    if not ok:
+        return False, err or "单格写入失败"
+    _set_last_error("")
+    return True, f"已更新飞书单元格 {sheet_id}!{a1}"
+
+
 def _detect_sheet_data_start_row(spreadsheet_token: str, sheet_id: str, token: str) -> int:
     """
     探测分表首条数据行（默认 2）。
@@ -1006,39 +1133,9 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
         return False, "无可写回列。"
 
     # 读取第 1、2 行并合并表头（与 _load_from_sheets 一致），否则双行表头分表的进度列无法对齐
-    try:
-        header_range = f"{sheet_id}!A1:ZZ1"
-        encoded_header = urllib.parse.quote(header_range, safe="")
-        header_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_header}"
-        req_header = urllib.request.Request(
-            header_url,
-            method="GET",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        with urllib.request.urlopen(req_header, timeout=30) as resp:
-            header_data = json.loads(resp.read().decode())
-        if header_data.get("code") != 0:
-            return False, f"读取原表头失败：code={header_data.get('code')} msg={header_data.get('msg')}"
-        header_values = header_data.get("data", {}).get("valueRange", {}).get("values", []) or []
-        row1 = [str(x).strip() if x is not None else "" for x in (header_values[0] if header_values else [])]
-        row2: list[str] = []
-        try:
-            h2_range = f"{sheet_id}!A2:ZZ2"
-            h2_enc = urllib.parse.quote(h2_range, safe="")
-            h2_url = f"{FEISHU_API_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{h2_enc}"
-            h2_req = urllib.request.Request(h2_url, method="GET", headers={"Authorization": f"Bearer {token}"})
-            with urllib.request.urlopen(h2_req, timeout=30) as resp:
-                h2_data = json.loads(resp.read().decode())
-            if h2_data.get("code") == 0:
-                h2_vals = (h2_data.get("data") or {}).get("valueRange", {}).get("values", []) or []
-                if h2_vals:
-                    row2 = [str(x).strip() if x is not None else "" for x in h2_vals[0]]
-        except Exception:
-            row2 = []
-        merged = _merge_sheet_header_rows(row1, row2)
-        target_cols = _dedupe_sheet_column_names(merged)
-    except Exception as e:
-        return False, f"读取原表头异常：{_format_http_error(e)}"
+    target_cols, hdr_err = _fetch_merged_target_cols_for_write(spreadsheet_token, sheet_id, token)
+    if hdr_err:
+        return False, hdr_err
 
     if not target_cols:
         target_cols = [str(c).strip() for c in source_cols if str(c).strip()]
@@ -1054,22 +1151,6 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
 
     # 1) 写数据（分块：行 + 列均受飞书单次上限约束）
     ncols = len(target_cols)
-
-    def _resolve_source_col(target_col: str) -> str | None:
-        # 直接命中
-        if target_col in source_cols:
-            return target_col
-        # 常见别名兼容
-        if target_col == "拟定金额" and "实际预计金额" in source_cols:
-            return "实际预计金额"
-        # 去括号弱匹配（例如 验收(社区需求完成交付) -> 验收）
-        tc_base = re.sub(r"[（(].*?[)）]", "", str(target_col)).strip()
-        for sc in source_cols:
-            scs = str(sc).strip()
-            sc_base = re.sub(r"[（(].*?[)）]", "", scs).strip()
-            if scs == target_col or sc_base == tc_base:
-                return sc
-        return None
 
     df_write = df_new.copy()
     if FEISHU_RECORD_ID_COL in df_write.columns:
@@ -1097,9 +1178,10 @@ def sync_sheets_full_replace(url_or_id: str, df_new: pd.DataFrame) -> tuple[bool
     for _, row in df_write.iterrows():
         one = []
         for tc in target_cols:
-            src = _resolve_source_col(tc)
+            src = _resolve_df_column_for_sheet_header(tc, source_cols)
             v = row.get(src, "") if src else ""
-            one.append(_normalize_cell_for_feishu(v, tc))
+            label = src if src else tc
+            one.append(_normalize_cell_for_feishu(v, label))
         values.append(one)
     if not values:
         return False, "写回数据为空（过滤后无可写入行）。"
